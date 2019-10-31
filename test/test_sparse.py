@@ -190,7 +190,7 @@ class TestSparse(TestCase):
         self.assertEqual(x._indices().numel(), 0)
         self.assertEqual(x._values().numel(), 0)
 
-    def test_coalecce(self):
+    def test_coalesce(self):
         for empty_i, empty_v, empty_nnz in itertools.product([True, False], repeat=3):
             sparse_size = [] if empty_i else [2, 1]
             dense_size = [1, 0, 2] if empty_v else [1, 2]
@@ -198,6 +198,22 @@ class TestSparse(TestCase):
 
             t, _, _ = self._gen_sparse(len(sparse_size), nnz, sparse_size + dense_size)
             self.safeCoalesce(t)  # this tests correctness
+
+        i = torch.LongTensor([[0, 0, 1, 1], [2, 2, 0, 0]])
+        v = torch.FloatTensor([[1, 1], [2, 2], [3, 3], [4, 4]])
+        hybrid_sparse = torch.sparse.FloatTensor(i, v).cpu()
+        self.assertEqual(hybrid_sparse.coalesce().to_dense(), torch.FloatTensor([[[0, 0], [0, 0], [3, 3]], [[7, 7], [0, 0], [0, 0]]]))
+        self.assertEqual(hybrid_sparse.coalesce('mean').to_dense(), torch.FloatTensor([[[0, 0], [0, 0], [1.5, 1.5]], [[3.5, 3.5], [0, 0], [0, 0]]]))
+        self.assertEqual(hybrid_sparse.coalesce('min').to_dense(), torch.FloatTensor([[[0, 0], [0, 0], [1, 1]], [[3, 3], [0, 0], [0, 0]]]))
+        self.assertEqual(hybrid_sparse.coalesce('max').to_dense(), torch.FloatTensor([[[0, 0], [0, 0], [2, 2]], [[4, 4], [0, 0], [0, 0]]]))
+        self.assertTrue(hybrid_sparse.coalesce().is_coalesced())
+
+        hybrid_sparse = torch.sparse.FloatTensor(i, v).cuda()
+        self.assertEqual(hybrid_sparse.coalesce().to_dense(), torch.FloatTensor([[[0, 0], [0, 0], [3, 3]], [[7, 7], [0, 0], [0, 0]]]).cuda())
+        self.assertEqual(hybrid_sparse.coalesce('mean').to_dense(), torch.FloatTensor([[[0, 0], [0, 0], [1.5, 1.5]], [[3.5, 3.5], [0, 0], [0, 0]]]).cuda())
+        self.assertEqual(hybrid_sparse.coalesce('min').to_dense(), torch.FloatTensor([[[0, 0], [0, 0], [1, 1]], [[3, 3], [0, 0], [0, 0]]]).cuda())
+        self.assertEqual(hybrid_sparse.coalesce('max').to_dense(), torch.FloatTensor([[[0, 0], [0, 0], [2, 2]], [[4, 4], [0, 0], [0, 0]]]).cuda())
+        self.assertTrue(hybrid_sparse.coalesce().is_coalesced())
 
     def test_ctor_size_checks(self):
         indices = self.index_tensor([
@@ -2092,6 +2108,7 @@ class TestSparse(TestCase):
             serialized = pickle.dumps(sp_tensor)
             sp_tensor_loaded = pickle.loads(serialized)
             self.assertEqual(sp_tensor, sp_tensor_loaded)
+
 
 
 class TestUncoalescedSparse(TestSparse):

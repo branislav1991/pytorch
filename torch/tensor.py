@@ -703,4 +703,44 @@ class Tensor(torch._C._TensorBase):
         else:
             return super(Tensor, self).rename(names)
 
+    def coalesce(self, coalesce_mode='sum'):
+        r"""Coalesces a SparseTensor (removes duplicate entries). Not implemented for dense Tensors. 
+
+        Args:
+            coalesce_mode:
+                'sum' - will sum over duplicate entries
+                'mean' - will calculate the mean of duplicate entries
+                'min' - will calculate the minimum over duplicate entries
+                'max' - will calculate the maximum over duplicate entries
+                Default: sum.
+
+        Example:
+
+            >>> i = torch.LongTensor([[0, 1, 1, 1], [2, 0, 2, 2]])
+            >>> v = torch.FloatTensor([3, 4, 5, 7])
+            >>> sp = torch.sparse.FloatTensor(i, v, torch.Size([2,3]))
+            >>> sp.coalesce()
+            tensor(indices=tensor([[0, 1, 1], [2, 0, 2]]),
+                    values=tensor([ 3.,  4., 12.]),
+                    size=(2, 3), nnz=3, layout=torch.sparse_coo)
+            >>> sp.coalesce('min')
+            tensor(indices=tensor([[0, 1, 1], [2, 0, 2]]),
+                    values=tensor([3., 4., 5.]),
+                    size=(2, 3), nnz=3, layout=torch.sparse_coo)
+            sp.coalesce('max')
+            tensor(indices=tensor([[0, 1, 1], [2, 0, 2]]),
+                    values=tensor([3., 4., 7.]),
+                    size=(2, 3), nnz=3, layout=torch.sparse_coo)
+        """
+        if coalesce_mode == 'sum':
+            return super(Tensor, self).coalesce(0)
+        elif coalesce_mode == 'mean':
+            return super(Tensor, self).coalesce(1)
+        elif coalesce_mode == 'min':
+            return super(Tensor, self).coalesce(2) 
+        elif coalesce_mode == 'max':
+            return super(Tensor, self).coalesce(3)
+        else:
+            raise ValueError("{} is not a valid value for coalesce_mode".format(coalesce_mode))
+
     __module__ = 'torch'

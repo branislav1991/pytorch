@@ -27,7 +27,7 @@ namespace at { namespace native {
 
 using namespace at::sparse;
 
-SparseTensor coalesce_sparse_cuda(const SparseTensor& self) {
+SparseTensor coalesce_sparse_cuda(const SparseTensor& self, c10::optional<int64_t> coalesce_mode) {
   int64_t nnz = self._nnz();
   if (self.is_coalesced()) {
     return self;
@@ -39,6 +39,13 @@ SparseTensor coalesce_sparse_cuda(const SparseTensor& self) {
     dst._coalesced_(true);
     return dst;
   }
+
+  // 0 - default value. Sum over duplicate entries
+  // 1 - compute mean over duplicate entries
+  // 2 - compute min over duplicate entries
+  // 3 - compute max over duplicate entries
+  int64_t mode = coalesce_mode.value_or(0);
+  TORCH_CHECK(mode >= 0 && mode <= 3, "possible modes: 0, 1, 2, 3 but was: ", mode);
 
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   auto allocator = THCThrustAllocator(globalContext().lazyInitCUDA());
@@ -106,7 +113,8 @@ SparseTensor coalesce_sparse_cuda(const SparseTensor& self) {
             newValues.data_ptr<scalar_t>(),
             nnz,
             newNnz,
-            stride
+            stride,
+            mode
           );
         });
   }

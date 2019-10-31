@@ -3303,7 +3303,7 @@
   device_guard: False
 
 
-- func: coalesce(Tensor self) -> Tensor
+- func: coalesce(Tensor self, int? coalesce_mode=None) -> Tensor
   use_c10_dispatcher: full
   variants: method
   dispatch:

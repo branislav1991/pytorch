@@ -352,7 +352,7 @@ SparseTensor& copy_sparse_(SparseTensor& self, const SparseTensor& src, bool non
   return self._coalesced_(src.is_coalesced());
 }
 
-SparseTensor coalesce_sparse_cpu(const SparseTensor& self) {
+SparseTensor coalesce_sparse_cpu(const SparseTensor& self, c10::optional<int64_t> coalesce_mode) {
   AT_ASSERT(self.defined());
   AT_ASSERT(!self.is_variable());  // TODO: change this to check `.requires_grad()` and `GradMode::is_enabled()` when Variable and Tensor are merged
   AT_ASSERT(self.is_sparse());
@@ -367,6 +367,13 @@ SparseTensor coalesce_sparse_cpu(const SparseTensor& self) {
     dst._coalesced_(true);
     return dst;
   }
+
+  // 0 - default value. Sum over duplicate entries
+  // 1 - compute mean over duplicate entries
+  // 2 - compute min over duplicate entries
+  // 3 - compute max over duplicate entries
+  int64_t mode = coalesce_mode.value_or(0);
+  TORCH_CHECK(mode >= 0 && mode <= 3, "possible modes: 0, 1, 2, 3 but was: ", mode);
 
   LongTensor indices = self._indices();
   Tensor values = self._values().contiguous();
@@ -399,12 +406,34 @@ SparseTensor coalesce_sparse_cpu(const SparseTensor& self) {
         int64_t blockSize = values.stride(0);
         scalar_t* values_ptr = values.data_ptr<scalar_t>();
         scalar_t* newValues_ptr = newValues.data_ptr<scalar_t>();
+        scalar_t mean_counter = 0; // use to calculate mean; reset when indices differ
         for (int64_t j = 0; j < nnz; j++) {
           int64_t pos = indicesPermutationAccessor[j];
           int64_t curr = indicesBufferAccessor[j];
           if (curr == prev) {
             if (values.numel() > 0) {  // if values is an empty tensor, there are no elements to copy
-              THBlas_axpy<scalar_t>(blockSize, 1, values_ptr + pos * blockSize, 1, newValues_ptr + i * blockSize, 1);
+              scalar_t* valuesIt = values_ptr + pos * blockSize;
+              scalar_t* newValuesIt = newValues_ptr + i * blockSize;
+              if (mode == 0) {
+                THBlas_axpy<scalar_t>(blockSize, 1, valuesIt, 1, newValuesIt, 1);
+              }
+              else if (mode == 1) { 
+                mean_counter += 1; 
+                auto val = std::vector<scalar_t>(blockSize);
+                for(int64_t b = 0; b < blockSize; ++b) { // paralellize this!
+                  *(newValuesIt + b) += (*(valuesIt + b) - *(newValuesIt + b)) / mean_counter;
+                }
+              }
+              else if (mode == 2) {
+                for(int64_t b = 0; b < blockSize; ++b) {
+                  *(newValuesIt + b) = *(valuesIt + b) < *(newValuesIt + b) ? *(valuesIt + b) : *(newValuesIt + b);
+                }
+              } 
+              else {
+                for(int64_t b = 0; b < blockSize; ++b) {
+                  *(newValuesIt + b) = *(valuesIt + b) > *(newValuesIt + b) ? *(valuesIt + b) : *(newValuesIt + b);
+                }
+              }
             }
           } else {
             ++i;
@@ -412,6 +441,7 @@ SparseTensor coalesce_sparse_cpu(const SparseTensor& self) {
               newIndicesAccessor[d][i] = indicesAccessor[d][pos];
             }
             if (values.numel() > 0) {  // if values is an empty tensor, there are no elements to copy
+              mean_counter = 1; // reset mean_counter
               THBlas_copy<scalar_t>(blockSize, values_ptr + pos * blockSize, 1, newValues_ptr + i * blockSize, 1);
             }
           }

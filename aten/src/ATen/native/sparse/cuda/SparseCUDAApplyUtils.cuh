@@ -2,6 +2,7 @@
 
 #include <ATen/cuda/detail/TensorInfo.cuh>
 #include <c10/macros/Macros.h>
+#include <ATen/cuda/NumericLimits.cuh>
 
 namespace at { namespace native {
 
@@ -299,7 +300,7 @@ template <typename Dtype, typename Acctype>
 __global__ void coalesceValuesKernel(
   int64_t *segment_offsets, int64_t *value_indices,
   Dtype *values, Dtype *newValues,
-  int64_t nnz, int64_t newNnz, int64_t stride) {
+  int64_t nnz, int64_t newNnz, int64_t stride, int64_t coalesce_mode) {
 
   int seg = blockIdx.x * 4 + threadIdx.y;
 
@@ -312,9 +313,11 @@ __global__ void coalesceValuesKernel(
     const int end = (seg < newNnz - 1) ? segment_offsets[seg + 1] : nnz;
     const int startFeature = threadIdx.x + blockIdx.y * blockDim.x * SZ;
     Acctype tmp[SZ];
+    Dtype mean_counter = 0;
+    Dtype value = coalesce_mode == 2 ? at::numeric_limits<Dtype>::upper_bound() : 0;
     #pragma unroll
     for (int ii = 0; ii < SZ; ii++) {
-      tmp[ii] = 0;
+      tmp[ii] = value;
     }
     for (int row = begin; row < end; row++) {
       const int valueRow = ((int) value_indices[row]) * stride;
@@ -326,7 +329,20 @@ __global__ void coalesceValuesKernel(
         int featureDim = startFeature + ii * C10_WARP_SIZE;
         if (featureDim < stride)
         {
-          tmp[ii] += static_cast<Acctype>(values[valueRow + featureDim]);
+          Dtype val = values[valueRow + featureDim];
+          if (coalesce_mode == 0) {
+            tmp[ii] += static_cast<Acctype>(val);
+          }
+          else if (coalesce_mode == 1) {
+            mean_counter += 1;
+            tmp[ii] += (static_cast<Acctype>(val) - tmp[ii]) / mean_counter;
+          }
+          else if (coalesce_mode == 2) {
+            tmp[ii] = val < tmp[ii] ? static_cast<Acctype>(val) : tmp[ii];
+          }
+          else if (coalesce_mode == 3) {
+            tmp[ii] = val > tmp[ii] ? static_cast<Acctype>(val) : tmp[ii];
+          }
         }
       }
     }
