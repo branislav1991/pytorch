@@ -1094,9 +1094,8 @@ class TestSparse(TestCase):
         test_shape(4, 0, [0, 0, 100, 5, 5, 5, 0])
 
     @skipIfRocm
-    def test_sparse_sum(self):
-
-        def run_tests(S, td=None):
+    def test_sparse_reduce(self):
+        def run_tests_summean(S, td=None):
             D = S.coalesce().to_dense().detach().requires_grad_(True)
             mask = (D == 0)
             if td is None:
@@ -1104,24 +1103,72 @@ class TestSparse(TestCase):
                 D_sum = D.sum()
                 self.assertEqual(S_sum, D_sum)
 
-                def fn(S):
+                def fn_sum(S):
                     res = torch.sparse.sum(S)
                     if res.is_sparse:
                         res = res.to_dense()
                     return res
-                gradcheck(fn, (S,), check_sparse_nnz=True)
+                gradcheck(fn_sum, (S,), check_sparse_nnz=True)
 
+                def fn_mean(S):
+                    res = torch.sparse.mean(S)
+                    if res.is_sparse:
+                        res = res.to_dense()
+                    return res
+                if not S.is_coalesced():
+                    self.assertRaises(RuntimeError, lambda: torch.sparse.mean(S))
+                else:
+                    gradcheck(fn_mean, (S,), check_sparse_nnz=True)
             else:
                 S_sum = torch.sparse.sum(S, td)
                 D_sum = D.sum(td)
                 self.assertEqual(S_sum.to_dense() if S_sum.is_sparse else S_sum, D_sum)
 
-                def fn(S):
+                def fn_sum(S):
                     res = torch.sparse.sum(S, td)
                     if res.is_sparse:
                         res = res.to_dense()
                     return res
-                gradcheck(fn, (S,), check_sparse_nnz=True)
+                gradcheck(fn_sum, (S,), check_sparse_nnz=True)
+
+                def fn_mean(S):
+                    res = torch.sparse.mean(S, td)
+                    if res.is_sparse:
+                        res = res.to_dense()
+                    return res
+                gradcheck(fn_mean, (S,), check_sparse_nnz=True)
+
+        def run_tests_minmax(S, td=None):
+            D = S.coalesce().to_dense().detach().requires_grad_(True)
+            mask = (D == 0)
+            if td is None:
+                def fn_min(S):
+                    res = torch.sparse.min(S)
+                    if res.is_sparse:
+                        res = res.to_dense()
+                    return res
+                gradcheck(fn_min, (S,), check_sparse_nnz=True)
+
+                def fn_max(S):
+                    res = torch.sparse.max(S)
+                    if res.is_sparse:
+                        res = res.to_dense()
+                    return res
+                gradcheck(fn_max, (S,), check_sparse_nnz=True)
+            else:
+                def fn_min(S):
+                    res = torch.sparse.min(S, td)
+                    if res.is_sparse:
+                        res = res.to_dense()
+                    return res
+                gradcheck(fn_min, (S,), check_sparse_nnz=True)
+
+                def fn_max(S):
+                    res = torch.sparse.max(S, td)
+                    if res.is_sparse:
+                        res = res.to_dense()
+                    return res
+                gradcheck(fn_max, (S,), check_sparse_nnz=True)
 
         nnz = 10
         sparse_dims = 2
@@ -1132,15 +1179,27 @@ class TestSparse(TestCase):
 
         # https://github.com/pytorch/pytorch/issues/16501
         x = torch.tensor([[1., 0., 0., 1.],
-                          [0., 1., 0., 0.],
-                          [0., 1., 1., 0.],
+                          [0., 3., 0., 0.],
+                          [0., 5., 1., 0.],
                           [0., 1., 0., 2.]]).to_sparse()
         self.assertEqual(torch.sparse.sum(x, dim=0), torch.sparse.sum(x, dim=-2))
         self.assertEqual(torch.sum(x.to_dense(), dim=0), torch.sparse.sum(x, dim=0).to_dense())
 
-        # not support SparseTensor.sum()
+        self.assertEqual(torch.sparse.mean(x, dim=0), torch.sparse.mean(x, dim=-2))
+        self.assertEqual(torch.tensor([1., 3., 1., 1.5]), torch.sparse.mean(x, dim=0).to_dense())
+
+        self.assertEqual(torch.sparse.min(x, dim=0), torch.sparse.min(x, dim=-2))
+        self.assertEqual(torch.tensor([1., 1., 1., 1.]), torch.sparse.min(x, dim=0).to_dense())
+
+        self.assertEqual(torch.sparse.max(x, dim=0), torch.sparse.max(x, dim=-2))
+        self.assertEqual(torch.tensor([1., 5., 1., 2.]), torch.sparse.max(x, dim=0).to_dense())
+
+        # not support SparseTensor.sum(), SparseTensor.mean(), SparseTensor.min(), SparseTensor.max()
         S = self._gen_sparse(sparse_dims, nnz, with_size)[0]
         self.assertRaises(RuntimeError, lambda: S.sum())
+        self.assertRaises(RuntimeError, lambda: S.mean())
+        self.assertRaises(RuntimeError, lambda: S.min())
+        self.assertRaises(RuntimeError, lambda: S.max())
 
         # dim out of range
         self.assertRaises(IndexError, lambda: torch.sparse.sum(S, 5))
@@ -1152,6 +1211,10 @@ class TestSparse(TestCase):
         empty_S = torch.sparse_coo_tensor(size=with_size)
         self.assertRaises(RuntimeError, lambda: torch.sparse.sum(empty_S, [0]))
         self.assertEqual(torch.sparse.sum(empty_S), torch.tensor(0,))
+        self.assertEqual(torch.sparse.mean(empty_S), torch.tensor(0,))
+        self.assertEqual(torch.sparse.min(empty_S), torch.tensor(0,))
+        self.assertEqual(torch.sparse.max(empty_S), torch.tensor(0,))
+
         empty_S.requires_grad_(True)
         empty_S_sum = torch.sparse.sum(empty_S)
         empty_S_sum.backward()
@@ -1159,11 +1222,16 @@ class TestSparse(TestCase):
 
         # test values().sum()
         S = self._gen_sparse(sparse_dims, nnz, with_size)[0]
-        run_tests(S.requires_grad_(True))
+        run_tests_summean(S.requires_grad_(True))
+        run_tests_minmax(S.requires_grad_(True))
 
         for test_dim in test_dims:
             S = self._gen_sparse(sparse_dims, nnz, with_size)[0]
-            run_tests(S.requires_grad_(True), test_dim)
+            run_tests_summean(S.requires_grad_(True), test_dim)
+
+        for test_dim in range(len(with_size)):
+            S = self._gen_sparse(sparse_dims, nnz, with_size)[0]
+            run_tests_minmax(S.requires_grad_(True), test_dim)
 
     def _test_basic_ops_shape(self, nnz_x1, nnz_x2, shape_i, shape_v=None):
         shape = shape_i + (shape_v or [])

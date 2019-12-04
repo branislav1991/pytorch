@@ -300,7 +300,7 @@ template <typename Dtype, typename Acctype>
 __global__ void coalesceValuesKernel(
   int64_t *segment_offsets, int64_t *value_indices,
   Dtype *values, Dtype *newValues,
-  int64_t nnz, int64_t newNnz, int64_t stride, int64_t coalesce_mode) {
+  int64_t nnz, int64_t newNnz, int64_t stride, int64_t mode) {
 
   int seg = blockIdx.x * 4 + threadIdx.y;
 
@@ -314,7 +314,7 @@ __global__ void coalesceValuesKernel(
     const int startFeature = threadIdx.x + blockIdx.y * blockDim.x * SZ;
     Acctype tmp[SZ];
     Dtype mean_counter = 0;
-    Dtype value = coalesce_mode == 2 ? at::numeric_limits<Dtype>::upper_bound() : 0;
+    Dtype value = mode == 2 ? at::numeric_limits<Dtype>::upper_bound() : 0;
     #pragma unroll
     for (int ii = 0; ii < SZ; ii++) {
       tmp[ii] = value;
@@ -330,17 +330,17 @@ __global__ void coalesceValuesKernel(
         if (featureDim < stride)
         {
           Dtype val = values[valueRow + featureDim];
-          if (coalesce_mode == 0) {
+          if (mode == 0) {
             tmp[ii] += static_cast<Acctype>(val);
           }
-          else if (coalesce_mode == 1) {
+          else if (mode == 1) {
             mean_counter += 1;
             tmp[ii] += (static_cast<Acctype>(val) - tmp[ii]) / mean_counter;
           }
-          else if (coalesce_mode == 2) {
+          else if (mode == 2) {
             tmp[ii] = val < tmp[ii] ? static_cast<Acctype>(val) : tmp[ii];
           }
-          else if (coalesce_mode == 3) {
+          else if (mode == 3) {
             tmp[ii] = val > tmp[ii] ? static_cast<Acctype>(val) : tmp[ii];
           }
         }

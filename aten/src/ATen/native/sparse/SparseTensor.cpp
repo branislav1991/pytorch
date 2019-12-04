@@ -352,7 +352,7 @@ SparseTensor& copy_sparse_(SparseTensor& self, const SparseTensor& src, bool non
   return self._coalesced_(src.is_coalesced());
 }
 
-SparseTensor coalesce_sparse_cpu(const SparseTensor& self, c10::optional<int64_t> coalesce_mode) {
+SparseTensor coalesce_sparse_cpu(const SparseTensor& self, c10::optional<int64_t> mode) {
   AT_ASSERT(self.defined());
   TORCH_INTERNAL_ASSERT(at::impl::variable_excluded_from_dispatch());
   AT_ASSERT(self.is_sparse());
@@ -372,8 +372,8 @@ SparseTensor coalesce_sparse_cpu(const SparseTensor& self, c10::optional<int64_t
   // 1 - compute mean over duplicate entries
   // 2 - compute min over duplicate entries
   // 3 - compute max over duplicate entries
-  int64_t mode = coalesce_mode.value_or(0);
-  TORCH_CHECK(mode >= 0 && mode <= 3, "possible modes: 0, 1, 2, 3 but was: ", mode);
+  int64_t _mode = mode.value_or(0);
+  TORCH_CHECK(_mode >= 0 && _mode <= 3, "possible modes: 0, 1, 2, 3 but was: ", _mode);
 
   LongTensor indices = self._indices();
   Tensor values = self._values().contiguous();
@@ -414,17 +414,16 @@ SparseTensor coalesce_sparse_cpu(const SparseTensor& self, c10::optional<int64_t
             if (values.numel() > 0) {  // if values is an empty tensor, there are no elements to copy
               scalar_t* valuesIt = values_ptr + pos * blockSize;
               scalar_t* newValuesIt = newValues_ptr + i * blockSize;
-              if (mode == 0) {
+              if (_mode == 0) {
                 THBlas_axpy<scalar_t>(blockSize, 1, valuesIt, 1, newValuesIt, 1);
               }
-              else if (mode == 1) { 
+              else if (_mode == 1) { 
                 mean_counter += 1; 
-                auto val = std::vector<scalar_t>(blockSize);
                 for(int64_t b = 0; b < blockSize; ++b) { // paralellize this!
-                  *(newValuesIt + b) += (*(valuesIt + b) - *(newValuesIt + b)) / mean_counter;
+                  *(newValuesIt + b) += (*(valuesIt + b) - *(newValuesIt + b)) / static_cast<scalar_t>(mean_counter);
                 }
               }
-              else if (mode == 2) {
+              else if (_mode == 2) {
                 for(int64_t b = 0; b < blockSize; ++b) {
                   *(newValuesIt + b) = *(valuesIt + b) < *(newValuesIt + b) ? *(valuesIt + b) : *(newValuesIt + b);
                 }

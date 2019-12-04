@@ -2903,11 +2903,43 @@
 
 - func: _sparse_sum.dim_dtype(Tensor self, int[1] dim, *, ScalarType dtype) -> Tensor
 
-- func: _sparse_sum_backward(Tensor grad, Tensor self, int[] dim) -> Tensor
+- func: _sparse_summean_backward(Tensor grad, Tensor self, int[] dim, bool mean) -> Tensor
   dispatch:
-      SparseCPU: _sparse_sum_backward_cpu
-      SparseCUDA: _sparse_sum_backward_cuda
+      SparseCPU: _sparse_summean_backward_cpu
+      SparseCUDA: _sparse_summean_backward_cuda
 
+- func: _sparse_mean(Tensor self) -> Tensor
+  use_c10_dispatcher: full
+
+- func: _sparse_mean.dtype(Tensor self, *, ScalarType dtype) -> Tensor
+
+- func: _sparse_mean.dim(Tensor self, int[1] dim) -> Tensor
+
+- func: _sparse_mean.dim_dtype(Tensor self, int[1] dim, *, ScalarType dtype) -> Tensor
+
+- func: _sparse_min(Tensor self) -> Tensor
+  use_c10_dispatcher: full
+
+- func: _sparse_min.dtype(Tensor self, *, ScalarType dtype) -> Tensor
+
+- func: _sparse_min.dim(Tensor self, int dim) -> Tensor
+
+- func: _sparse_min.dim_dtype(Tensor self, int dim, *, ScalarType dtype) -> Tensor
+
+- func: _sparse_max(Tensor self) -> Tensor
+  use_c10_dispatcher: full
+
+- func: _sparse_max.dtype(Tensor self, *, ScalarType dtype) -> Tensor
+
+- func: _sparse_max.dim(Tensor self, int dim) -> Tensor
+
+- func: _sparse_max.dim_dtype(Tensor self, int dim, *, ScalarType dtype) -> Tensor
+
+- func: _sparse_minmax_backward(Tensor grad, Tensor self, Tensor output, int dim) -> Tensor
+  dispatch:
+      SparseCPU: _sparse_minmax_backward_cpu
+      SparseCUDA: _sparse_minmax_backward_cuda
+      
 - func: norm.ScalarOpt_dtype(Tensor self, Scalar? p, *, ScalarType dtype) -> Tensor
   variants: function, method
 
@@ -3309,7 +3341,7 @@
   device_guard: False
 
 
-- func: coalesce(Tensor self, int? coalesce_mode=None) -> Tensor
+- func: coalesce(Tensor self, int? mode=None) -> Tensor
   use_c10_dispatcher: full
   variants: method
   dispatch:

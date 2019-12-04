@@ -134,3 +134,102 @@ def sum(input, dim=None, dtype=None):
             return torch._sparse_sum(input, dim, dtype=dtype)
         else:
             return torch._sparse_sum(input, dtype=dtype)
+
+
+def mean(input, dim=None, dtype=None):
+    # type: (Tensor, Optional[Tuple[int]], Optional[int]) -> Tensor
+    r"""
+    Returns the mean of each row of SparseTensor :attr:`input` in the given
+    dimensions :attr:`dim`. If :attr:`dim` is a list of dimensions,
+    reduce over all of them. When mean over all ``sparse_dim``, this method
+    returns a Tensor instead of SparseTensor.
+
+    All reduced :attr:`dim` are squeezed (see :func:`torch.squeeze`), resulting an output
+    tensor having :attr:`dim` fewer dimensions than :attr:`input`.
+
+    During backward, only gradients at ``nnz`` locations of :attr:`input`
+    will propagate back. Note that the gradients of :attr:`input` is coalesced.
+
+    Args:
+        input (Tensor): the input SparseTensor
+        dim (int or tuple of ints): a dimension or a list of dimensions to reduce. Default: reduce
+            over all dims.
+        dtype (:class:`torch.dtype`, optional): the desired data type of returned Tensor.
+            Default: dtype of :attr:`input`.
+    """
+    if dtype is None:
+        if dim is not None:
+            return torch._sparse_mean(input, dim)
+        else:
+            return torch._sparse_mean(input)
+    else:
+        if dim is not None:
+            return torch._sparse_mean(input, dim, dtype=dtype)
+        else:
+            return torch._sparse_mean(input, dtype=dtype)
+
+
+def min(input, dim=None, dtype=None):
+    # type: (Tensor, Optional[int], Optional[int]) -> Tensor
+    r"""
+    Returns the min of each row of SparseTensor :attr:`input` in the given
+    dimensions :attr:`dim`. If :attr:`dim` is a list of dimensions,
+    reduce over all of them. When min over all ``sparse_dim``, this method
+    returns a Tensor instead of SparseTensor.
+
+    All reduced :attr:`dim` are squeezed (see :func:`torch.squeeze`), resulting an output
+    tensor having :attr:`dim` fewer dimensions than :attr:`input`.
+
+    During backward, only gradients at ``nnz`` locations of :attr:`input`
+    will propagate back. Note that the gradients of :attr:`input` is coalesced.
+
+    Args:
+        input (Tensor): the input SparseTensor
+        dim (int): a dimension or a list of dimensions to reduce. Default: reduce
+            over all dims.
+        dtype (:class:`torch.dtype`, optional): the desired data type of returned Tensor.
+            Default: dtype of :attr:`input`.
+    """
+    if dtype is None:
+        if dim is not None:
+            return torch._sparse_min(input, dim)
+        else:
+            return torch._sparse_min(input)
+    else:
+        if dim is not None:
+            return torch._sparse_min(input, dim, dtype=dtype)
+        else:
+            return torch._sparse_min(input, dtype=dtype)
+
+
+def max(input, dim=None, dtype=None):
+    # type: (Tensor, Optional[int], Optional[int]) -> Tensor
+    r"""
+    Returns the max of each row of SparseTensor :attr:`input` in the given
+    dimensions :attr:`dim`. If :attr:`dim` is a list of dimensions,
+    reduce over all of them. When max over all ``sparse_dim``, this method
+    returns a Tensor instead of SparseTensor.
+
+    All reduced :attr:`dim` are squeezed (see :func:`torch.squeeze`), resulting an output
+    tensor having :attr:`dim` fewer dimensions than :attr:`input`.
+
+    During backward, only gradients at ``nnz`` locations of :attr:`input`
+    will propagate back. Note that the gradients of :attr:`input` is coalesced.
+
+    Args:
+        input (Tensor): the input SparseTensor
+        dim (int): a dimension or a list of dimensions to reduce. Default: reduce
+            over all dims.
+        dtype (:class:`torch.dtype`, optional): the desired data type of returned Tensor.
+            Default: dtype of :attr:`input`.
+    """
+    if dtype is None:
+        if dim is not None:
+            return torch._sparse_max(input, dim)
+        else:
+            return torch._sparse_max(input)
+    else:
+        if dim is not None:
+            return torch._sparse_max(input, dim, dtype=dtype)
+        else:
+            return torch._sparse_max(input, dtype=dtype)

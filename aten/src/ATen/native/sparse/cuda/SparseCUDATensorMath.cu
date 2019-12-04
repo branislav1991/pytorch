@@ -520,7 +520,38 @@ template <typename scalar_t>
 #ifdef __HIP_PLATFORM_HCC__
 C10_LAUNCH_BOUNDS_1(512)
 #endif
-__global__ void _sparse_sum_backward_cuda_kernel(
+__global__ void _sparse_summean_backward_divider_cuda_kernel(
+  int64_t total_threads,
+  const TensorInfo<int64_t, int64_t> grad_indices_ti,
+  const TensorInfo<int64_t, int64_t> input_indices_ti,
+  const TensorInfo<int64_t, int64_t> input_indices_pos_ti,
+  const TensorInfo<scalar_t, int64_t> grad_values_expand_ti,
+  TensorInfo<scalar_t, int64_t> divider_values_expand_ti 
+) {
+  const int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= total_threads) return;
+  const int64_t j = input_indices_pos_ti.data[i];
+
+  bool has_match = false;
+  if (grad_indices_ti.data[j] == input_indices_ti.data[i]) {
+    has_match = true;
+  }
+
+  int64_t in_start = j * grad_values_expand_ti.strides[0];
+  int64_t in_end = (j + 1) * grad_values_expand_ti.strides[0];
+
+  if (has_match) {
+    for (int64_t in_i = in_start; in_i < in_end; in_i++) {
+      atomicAdd(divider_values_expand_ti.data + in_i, 1);
+    }
+  }
+}
+
+template <typename scalar_t>
+#ifdef __HIP_PLATFORM_HCC__
+C10_LAUNCH_BOUNDS_1(512)
+#endif
+__global__ void _sparse_summean_backward_scatter_cuda_kernel(
   int64_t total_threads,
   const TensorInfo<int64_t, int64_t> grad_indices_ti,
   const TensorInfo<int64_t, int64_t> input_indices_ti,
@@ -554,9 +585,9 @@ __global__ void _sparse_sum_backward_cuda_kernel(
   }
 }
 
-Tensor _sparse_sum_backward_cuda(const Tensor& grad_, const SparseTensor& input_, IntArrayRef dims_to_sum) {
-  TORCH_CHECK(grad_.is_cuda(), "_sparse_sum_backward_cuda: expected 'grad_' to be CUDA tensor, but got CPU tensor");
-  TORCH_CHECK(input_.is_cuda(), "_sparse_sum_backward_cuda: expected 'input_' to be CUDA tensor, but got CPU tensor");
+Tensor _sparse_summean_backward_cuda(const Tensor& grad_, const SparseTensor& input_, IntArrayRef dims_to_sum, bool mean) {
+  TORCH_CHECK(grad_.is_cuda(), "_sparse_summean_backward_cuda: expected 'grad_' to be CUDA tensor, but got CPU tensor");
+  TORCH_CHECK(input_.is_cuda(), "_sparse_summean_backward_cuda: expected 'input_' to be CUDA tensor, but got CPU tensor");
 
   auto input = input_.coalesce();
   const int64_t input_dim = input.dim();
@@ -589,20 +620,26 @@ Tensor _sparse_sum_backward_cuda(const Tensor& grad_, const SparseTensor& input_
   const bool sum_sparse_dim = (sparse_dims_to_sum_size > 0);
 
   if (sum_all_sparse_dim) {
-    TORCH_CHECK(!grad_.is_sparse(), "_sparse_sum_backward_cuda: expected grad Tensor to be dense since all sparse dims are summed");
+    TORCH_CHECK(!grad_.is_sparse(), "_sparse_summean_backward_cuda: expected grad Tensor to be dense since all sparse dims are summed");
     auto grad_input_values = grad_;
     auto expand_size = input_values.sizes().vec();
     if (sum_dense_dim) {
       auto dense_expand_size = std::vector<int64_t>(expand_size);
+      int64_t num_coalesced_elems = 1;
       dense_expand_size.erase(dense_expand_size.begin()); // remove nnz dim
-      for (auto d : dense_dims_to_sum_v) grad_input_values = grad_input_values.unsqueeze(d - 1); // -1 since grad has no nnz dim
+      for (auto d : dense_dims_to_sum_v) {
+        grad_input_values = grad_input_values.unsqueeze(d - 1); // -1 since grad has no nnz dim
+        num_coalesced_elems *= dense_expand_size[d - 1];
+      }
       grad_input_values = grad_input_values.expand(dense_expand_size);
+      if (mean) grad_input_values /= at::tensor(num_coalesced_elems, grad_input_values.options());
     }
     grad_input_values = grad_input_values.expand(expand_size).clone(at::MemoryFormat::Contiguous);
+    if (mean) grad_input_values /= at::tensor(input._nnz(), grad_input_values.options());
     return at::_sparse_coo_tensor_with_dims_and_tensors(input_sparse_dim, input_dense_dim, input_sizes, input_indices.clone(at::MemoryFormat::Contiguous), grad_input_values,  input.options().dtype(grad_.dtype())); // convert to grad dtype
   }
   else {
-    TORCH_CHECK(grad_.is_sparse(), "_sparse_sum_backward_cuda: expected grad_ Tensor to be sparse, but got dense");
+    TORCH_CHECK(grad_.is_sparse(), "_sparse_summean_backward_cuda: expected grad_ Tensor to be sparse, but got dense");
     auto grad = grad_.coalesce();
     LongTensor grad_indices = grad._indices();
     Tensor grad_values = grad._values();
@@ -612,9 +649,14 @@ Tensor _sparse_sum_backward_cuda(const Tensor& grad_, const SparseTensor& input_
     Tensor grad_values_expand = grad_values;
     if (sum_dense_dim) {
       auto expand_size = input_values.sizes().vec();
+      int64_t num_coalesced_elems = 1;
       if (sum_sparse_dim) expand_size[0] = grad_values.size(0); // update nnz
-      for (auto d : dense_dims_to_sum_v) grad_values_expand = grad_values_expand.unsqueeze(d);
+      for (auto d : dense_dims_to_sum_v) {
+        grad_values_expand = grad_values_expand.unsqueeze(d);
+        num_coalesced_elems *= expand_size[d];
+      }
       grad_values_expand = grad_values_expand.expand(expand_size).clone(at::MemoryFormat::Contiguous);
+      if (mean) grad_values_expand /= at::tensor(num_coalesced_elems, grad_values_expand.options());
     }
 
     Tensor grad_input_values;
@@ -631,6 +673,9 @@ Tensor _sparse_sum_backward_cuda(const Tensor& grad_, const SparseTensor& input_
 
       grad_input_values = at::empty_like(input_values, grad_values.options(), LEGACY_CONTIGUOUS_MEMORY_FORMAT);
       AT_ASSERT(grad_input_values.is_cuda());
+
+      auto divider_values_expand = at::zeros_like(grad_values_expand, grad_values.options(), LEGACY_CONTIGUOUS_MEMORY_FORMAT);
+      auto divider_input_values = at::ones_like(input_values, grad_values.options(), LEGACY_CONTIGUOUS_MEMORY_FORMAT);
 
       // get 1D indices
       auto grad_sparse_dim_to_keep_v = std::vector<int64_t>(grad_sparse_dim);
@@ -653,17 +698,33 @@ Tensor _sparse_sum_backward_cuda(const Tensor& grad_, const SparseTensor& input_
       int64_t total_threads = input_nnz;
       const dim3 block = dim3(std::min(static_cast<int64_t>(cuda::getApplyBlock().x), total_threads));
       dim3 grid;
-      TORCH_CHECK(cuda::getApplyGrid(total_threads, grid, curDevice), "_sparse_sum_backward_cuda: input too large or too many dimensions");
+      TORCH_CHECK(cuda::getApplyGrid(total_threads, grid, curDevice), "_sparse_summean_backward_cuda: input too large or too many dimensions");
 
       auto grad_indices_ti = getTensorInfo<int64_t, int64_t>(grad_indices_1D);
       auto input_indices_ti = getTensorInfo<int64_t, int64_t>(input_indices_1D);
       auto input_indices_pos_ti = getTensorInfo<int64_t, int64_t>(input_indices_pos);
 
-      AT_DISPATCH_FLOATING_TYPES_AND_HALF(grad_values.scalar_type(), "_sparse_sum_backward_cuda", [&] {
+      if (mean) {
+        AT_DISPATCH_FLOATING_TYPES_AND_HALF(grad_values.scalar_type(), "_sparse_summean_backward_cuda", [&] {
+          auto grad_values_expand_ti = getTensorInfo<scalar_t, int64_t>(grad_values_expand);
+          auto divider_values_expand_ti = getTensorInfo<scalar_t, int64_t>(divider_values_expand);
+
+          _sparse_summean_backward_divider_cuda_kernel<scalar_t><<<grid, block, 0, stream>>>(
+            total_threads,
+            grad_indices_ti,
+            input_indices_ti,
+            input_indices_pos_ti,
+            grad_values_expand_ti,
+            divider_values_expand_ti
+          );
+        });
+      }
+
+      AT_DISPATCH_FLOATING_TYPES_AND_HALF(grad_values.scalar_type(), "_sparse_summean_backward_cuda", [&] {
         auto grad_values_expand_ti = getTensorInfo<scalar_t, int64_t>(grad_values_expand);
         auto grad_input_values_ti = getTensorInfo<scalar_t, int64_t>(grad_input_values);
 
-        _sparse_sum_backward_cuda_kernel<scalar_t><<<grid, block, 0, stream>>>(
+        _sparse_summean_backward_scatter_cuda_kernel<scalar_t><<<grid, block, 0, stream>>>(
           total_threads,
           grad_indices_ti,
           input_indices_ti,
@@ -676,6 +737,172 @@ Tensor _sparse_sum_backward_cuda(const Tensor& grad_, const SparseTensor& input_
 
     return at::_sparse_coo_tensor_with_dims_and_tensors(input_sparse_dim, input_dense_dim, input_sizes, input_indices.clone(at::MemoryFormat::Contiguous), grad_input_values, grad.options());
   }
+}
+
+// --------------------------------------------------------------------
+// sparse.minmax() backward
+//
+// see NOTE [ sparse.minmax() backward ]
+// --------------------------------------------------------------------
+template <typename scalar_t>
+#ifdef __HIP_PLATFORM_HCC__
+C10_LAUNCH_BOUNDS_1(512)
+#endif
+__global__ void _sparse_minmax_backward_cuda_kernel(
+  int64_t total_threads,
+  PackedTensorAccessor64<scalar_t, 1> result_accessor,
+  PackedTensorAccessor64<scalar_t, 1> input_accessor,
+  const TensorInfo<int64_t, int64_t> grad_indices_ti,
+  const TensorInfo<int64_t, int64_t> input_indices_ti,
+  const TensorInfo<int64_t, int64_t> input_indices_pos_ti,
+  const TensorInfo<scalar_t, int64_t> grad_values_expand_ti,
+  TensorInfo<scalar_t, int64_t> grad_input_values_ti
+) {
+  const int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= total_threads) return;
+  const int64_t j = input_indices_pos_ti.data[i];
+
+  bool has_match = false;
+  if (grad_indices_ti.data[j] == input_indices_ti.data[i]) {
+    has_match = true;
+  }
+
+  int64_t grad_input_values_stride0 = grad_input_values_ti.strides[0];
+  int64_t out_start = i * grad_input_values_stride0;
+  int64_t out_end = (i + 1) * grad_input_values_stride0;
+  int64_t in_start = j * grad_values_expand_ti.strides[0];
+
+  if (has_match) {
+    for (int64_t out_i = out_start, in_i = in_start; out_i < out_end; out_i++, in_i++) {
+      if (result_accessor[out_i] == input_accessor[in_i]) {
+        grad_input_values_ti.data[out_i] = grad_values_expand_ti.data[in_i];
+      }
+      else {
+        grad_input_values_ti.data[out_i] = scalar_t(0);
+      }
+    }
+  }
+  else {
+    for (int64_t out_i = out_start; out_i < out_end; out_i++) {
+      grad_input_values_ti.data[out_i] = scalar_t(0);
+    }
+  }
+}
+
+Tensor _sparse_minmax_backward_cuda(const Tensor& grad_, const SparseTensor& input_, const Tensor& result_, int64_t dim_to_minmax) {
+  TORCH_CHECK(grad_.is_cuda(), "_sparse_sum_backward_cuda: expected 'grad_' to be CUDA tensor, but got CPU tensor");
+  TORCH_CHECK(input_.is_cuda(), "_sparse_sum_backward_cuda: expected 'input_' to be CUDA tensor, but got CPU tensor");
+
+  auto input = input_.coalesce();
+  const int64_t input_dim = input.dim();
+  maybe_wrap_dim(dim_to_minmax, input_dim);
+
+  LongTensor input_indices = input._indices();
+  Tensor input_values = input._values();
+  IntArrayRef input_sizes = input.sizes();
+  const int64_t input_sparse_dim = input.sparse_dim();
+  const int64_t input_dense_dim = input.dense_dim();
+  const int64_t input_nnz = input._nnz();
+
+  auto result = result_.coalesce();
+  LongTensor result_indices = result._indices();
+  Tensor result_values = result._values();
+
+  auto grad_input_values = grad_;
+  if (dim_to_minmax < input_sparse_dim) {
+    // we are minmaxing over a sparse dimension
+    if (input_sparse_dim == 1) {
+      TORCH_CHECK(!grad_.is_sparse(), "_sparse_minmax_backward_cuda: expected grad_ Tensor to be dense since all sparse dims are reduced");
+      auto expand_size = input_values.sizes().vec();
+
+      grad_input_values = grad_input_values.expand(expand_size).clone();
+      result_values = result_values.expand(expand_size);
+      grad_input_values.masked_fill_(result_values != input_values, 0);
+      return at::_sparse_coo_tensor_with_dims_and_tensors(input_sparse_dim, input_dense_dim, input_sizes, input_indices.clone(), grad_input_values, input.options().dtype(grad_.dtype())); // convert to grad dtype
+    }
+    else {
+      TORCH_CHECK(grad_.is_sparse(), "_sparse_minmax_backward_cuda: expected grad_ Tensor to be sparse, but got dense");
+      auto grad = grad_.coalesce();
+      LongTensor grad_indices = grad._indices();
+      Tensor grad_values = grad._values();
+      const int64_t grad_sparse_dim = grad.sparse_dim();
+      const int64_t grad_nnz = grad._nnz();
+
+      Tensor grad_values_expand = grad_values;
+
+      Tensor grad_input_values;
+      int curDevice = -1;
+      cudaGetDevice(&curDevice);
+      cudaStream_t stream = at::cuda::getCurrentCUDAStream(curDevice);
+      auto allocator = THCThrustAllocator(globalContext().lazyInitCUDA());
+      auto policy = thrust::cuda::par(allocator).on(stream);
+      typedef thrust::device_ptr<int64_t> thrust_ptr;
+
+      grad_input_values = at::empty_like(input_values, grad_values.options());
+      AT_ASSERT(grad_input_values.is_cuda());
+
+      // get 1D indices
+      auto sparse_dims_to_keep_v = std::vector<int64_t>(input_sparse_dim);
+      std::iota(sparse_dims_to_keep_v.begin(), sparse_dims_to_keep_v.end(), 0);
+      sparse_dims_to_keep_v.erase(sparse_dims_to_keep_v.begin() + dim_to_minmax);
+      auto grad_sparse_dim_to_keep_v = std::vector<int64_t>(grad_sparse_dim);
+      std::iota(grad_sparse_dim_to_keep_v.begin(), grad_sparse_dim_to_keep_v.end(), 0);
+
+      auto grad_indices_1D = flatten_indices_by_dims(grad_indices, grad.sizes(), grad_sparse_dim_to_keep_v); // flatten indices on all sparse_dim of grad, output indices is coalesced and sorted
+      auto input_indices_1D = flatten_indices_by_dims(input_indices, input_sizes, sparse_dims_to_keep_v);
+      thrust_ptr grad_indices_iter(grad_indices_1D.data_ptr<int64_t>());
+      thrust_ptr input_indices_iter(input_indices_1D.data_ptr<int64_t>());
+
+      // store lower_bound of input indices at grad indices
+      LongTensor input_indices_pos = at::empty_like(input_indices_1D);
+      thrust_ptr input_indices_pos_iter(input_indices_pos.data_ptr<int64_t>());
+      thrust::lower_bound(policy,
+                          grad_indices_iter, grad_indices_iter + grad_nnz,
+                          input_indices_iter, input_indices_iter + input_nnz,
+                          input_indices_pos_iter);
+
+      // config to run cuda kernel
+      int64_t total_threads = input_nnz;
+      const dim3 block = dim3(std::min(static_cast<int64_t>(cuda::getApplyBlock().x), total_threads));
+      dim3 grid;
+      TORCH_CHECK(cuda::getApplyGrid(total_threads, grid, curDevice), "_sparse_minmax_backward_cuda: input too large or too many dimensions");
+
+      auto grad_indices_ti = getTensorInfo<int64_t, int64_t>(grad_indices_1D);
+      auto input_indices_ti = getTensorInfo<int64_t, int64_t>(input_indices_1D);
+      auto input_indices_pos_ti = getTensorInfo<int64_t, int64_t>(input_indices_pos);
+
+      AT_DISPATCH_FLOATING_TYPES_AND_HALF(grad_values.scalar_type(), "_sparse_minmax_backward_cuda", [&] {
+        auto grad_values_expand_ti = getTensorInfo<scalar_t, int64_t>(grad_values_expand);
+        auto grad_input_values_ti = getTensorInfo<scalar_t, int64_t>(grad_input_values);
+
+        auto result_values_1D = at::flatten(result_values);
+        auto input_values_1D = at::flatten(input_values);
+        auto result_values_1D_accessor = result_values_1D.packed_accessor64<scalar_t, 1>();
+        auto input_values_1D_accessor = input_values_1D.packed_accessor64<scalar_t, 1>();
+
+        _sparse_minmax_backward_cuda_kernel<scalar_t><<<grid, block, 0, stream>>>(
+          total_threads,
+          result_values_1D_accessor,
+          input_values_1D_accessor,
+          grad_indices_ti,
+          input_indices_ti,
+          input_indices_pos_ti,
+          grad_values_expand_ti,
+          grad_input_values_ti
+        );
+      });
+    }
+  }
+  else {
+    // we are minmaxing over a dense dimension
+    auto expand_size = input_values.sizes().vec();
+    grad_input_values = grad_input_values.unsqueeze(dim_to_minmax - input_sparse_dim);
+    grad_input_values = grad_input_values.expand(expand_size).clone();
+    auto result_values_expand = result_values.expand(expand_size);
+    grad_input_values.masked_fill_(input_values != result_values_expand, 0);
+  }
+
+  return at::_sparse_coo_tensor_with_dims_and_tensors(input_sparse_dim, input_dense_dim, input_sizes, input_indices.clone(), grad_input_values, grad_.options());
 }
 
 }} // namespace at::native

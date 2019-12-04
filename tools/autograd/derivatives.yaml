@@ -239,7 +239,7 @@
 - name: clone(Tensor self, *, MemoryFormat? memory_format=None) -> Tensor
   self: grad
 
-- name: coalesce(Tensor self, int? coalesce_mode=None) -> Tensor
+- name: coalesce(Tensor self, int? mode=None) -> Tensor
   self: grad
 
 - name: conj(Tensor self) -> Tensor
@@ -937,7 +937,16 @@
   values: sparse_constructor_values_backward(grad, indices, values.sizes())
 
 - name: _sparse_sum.dim(Tensor self, int[1] dim) -> Tensor
-  self: at::_sparse_sum_backward(grad, self, dim)
+  self: at::_sparse_summean_backward(grad, self, dim, false)
+
+- name: _sparse_mean.dim(Tensor self, int[1] dim) -> Tensor
+  self: at::_sparse_summean_backward(grad, self, dim, true)
+
+- name: _sparse_min.dim(Tensor self, int dim) -> Tensor
+  self: at::_sparse_minmax_backward(grad, self, result, dim)
+
+- name: _sparse_max.dim(Tensor self, int dim) -> Tensor
+  self: at::_sparse_minmax_backward(grad, self, result, dim)
 
 - name: _standard_gamma(Tensor self, Generator? generator=None) -> Tensor
   self: grad * _standard_gamma_grad(self, result)
