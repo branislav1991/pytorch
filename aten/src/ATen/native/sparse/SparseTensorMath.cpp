@@ -164,6 +164,7 @@ Tensor& div_sparse_(Tensor& self, const Tensor& value) {
 SparseTensor& div_out_sparse_zerodim(SparseTensor& r, const SparseTensor& t, const Tensor& value) {
   TORCH_CHECK(value.dim() == 0, "sparse division only supports division by a scalar (got shape ",
       value.sizes(), " for argument 'other')");
+  TORCH_CHECK(!value.is_sparse(), "A Sparse Tensor can only be divided by a scalar or zero-dim dense tensor");
 
   AT_ASSERT(r.is_sparse());
   AT_ASSERT(t.is_sparse());
@@ -1306,7 +1307,7 @@ Tensor _sparse_summean_backward_cpu(const Tensor& grad_, const SparseTensor& inp
     Tensor grad_input_values;
     if (sum_sparse_dim) {
       // see NOTE [ sparse.sum() backward ]
-      grad_input_values = at::zeros_like(input_values, grad_values.options());
+      grad_input_values = at::zeros_like(input_values, grad_values.options(), LEGACY_CONTIGUOUS_MEMORY_FORMAT);
       auto divider_values_expand = at::zeros_like(grad_values_expand, grad_values.options());
       auto divider_input_values = at::ones_like(input_values, grad_values.options());
 
@@ -1471,6 +1472,26 @@ Tensor _sparse_minmax_backward_cpu(const Tensor& grad_, const SparseTensor& inpu
   }
 
   return at::_sparse_coo_tensor_with_dims_and_tensors(input_sparse_dim, input_dense_dim, input_sizes, input_indices.clone(), grad_input_values, grad_.options());
+}
+
+Tensor isnan_sparse(const Tensor & self){
+  TORCH_INTERNAL_ASSERT(self.is_sparse());
+  SparseTensor out =  at::sparse_coo_tensor({0}, self.options().dtype(at::kBool));
+  out.resize_as_(self);
+  auto indices = out._indices();
+  indices.resize_as_(self._indices());
+  indices.copy_(self._indices());
+  Tensor out_values = out._values();
+  out_values.resize_as_(self._values());
+  Tensor nan_values = at::isnan(self._values());
+  out_values.copy_(nan_values);
+  return out;
+}
+
+Tensor any_sparse(const Tensor& self) {
+  TORCH_INTERNAL_ASSERT(self.is_sparse());
+
+  return at::any(self._values());
 }
 
 }} // namespace at::native
