@@ -1115,10 +1115,7 @@ class TestSparse(TestCase):
                     if res.is_sparse:
                         res = res.to_dense()
                     return res
-                if not S.is_coalesced():
-                    self.assertRaises(RuntimeError, lambda: torch.sparse.mean(S))
-                else:
-                    gradcheck(fn_mean, (S,), check_sparse_nnz=True)
+                gradcheck(fn_mean, (S,), check_sparse_nnz=True)
             else:
                 S_sum = torch.sparse.sum(S, td)
                 D_sum = D.sum(td)
@@ -1136,7 +1133,10 @@ class TestSparse(TestCase):
                     if res.is_sparse:
                         res = res.to_dense()
                     return res
-                gradcheck(fn_mean, (S,), check_sparse_nnz=True)
+                if not S.is_coalesced():
+                    self.assertRaises(RuntimeError, lambda: fn_mean(S))
+                else:
+                    gradcheck(fn_mean, (S,), check_sparse_nnz=True)
 
         def run_tests_minmax(S, td=None):
             D = S.coalesce().to_dense().detach().requires_grad_(True)
