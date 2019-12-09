@@ -239,7 +239,7 @@
 - name: clone(Tensor self, *, MemoryFormat? memory_format=None) -> Tensor
   self: grad
 
-- name: coalesce(Tensor self, int? mode=None) -> Tensor
+- name: coalesce(Tensor self, int? mode_=None) -> Tensor
   self: grad
 
 - name: conj(Tensor self) -> Tensor
