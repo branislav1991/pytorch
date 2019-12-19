@@ -557,7 +557,9 @@ __global__ void _sparse_summean_backward_scatter_cuda_kernel(
   const TensorInfo<int64_t, int64_t> input_indices_ti,
   const TensorInfo<int64_t, int64_t> input_indices_pos_ti,
   const TensorInfo<scalar_t, int64_t> grad_values_expand_ti,
-  TensorInfo<scalar_t, int64_t> grad_input_values_ti
+  TensorInfo<scalar_t, int64_t> grad_input_values_ti,
+  TensorInfo<scalar_t, int64_t> divider_values_expand_ti,
+  TensorInfo<scalar_t, int64_t> divider_input_values_ti
 ) {
   const int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= total_threads) return;
@@ -576,11 +578,13 @@ __global__ void _sparse_summean_backward_scatter_cuda_kernel(
   if (has_match) {
     for (int64_t out_i = out_start, in_i = in_start; out_i < out_end; out_i++, in_i++) {
       grad_input_values_ti.data[out_i] = grad_values_expand_ti.data[in_i];
+      divider_input_values_ti.data[out_i] = divider_values_expand_ti.data[in_i];
     }
   }
   else {
     for (int64_t out_i = out_start; out_i < out_end; out_i++) {
       grad_input_values_ti.data[out_i] = scalar_t(0);
+      divider_input_values_ti.data[out_i] = scalar_t(1);
     }
   }
 }
@@ -632,7 +636,10 @@ Tensor _sparse_summean_backward_cuda(const Tensor& grad_, const SparseTensor& in
         num_coalesced_elems *= dense_expand_size[d - 1];
       }
       grad_input_values = grad_input_values.expand(dense_expand_size);
-      if (mean) grad_input_values /= at::tensor(num_coalesced_elems, grad_input_values.options());
+      if (mean) {
+        grad_input_values = grad_input_values.clone(at::MemoryFormat::Contiguous);
+        grad_input_values /= at::tensor(num_coalesced_elems, grad_input_values.options());
+      }
     }
     grad_input_values = grad_input_values.expand(expand_size).clone(at::MemoryFormat::Contiguous);
     if (mean) grad_input_values /= at::tensor(input._nnz(), grad_input_values.options());
@@ -675,7 +682,9 @@ Tensor _sparse_summean_backward_cuda(const Tensor& grad_, const SparseTensor& in
       AT_ASSERT(grad_input_values.is_cuda());
 
       auto divider_values_expand = at::zeros_like(grad_values_expand, grad_values.options(), LEGACY_CONTIGUOUS_MEMORY_FORMAT);
-      auto divider_input_values = at::ones_like(input_values, grad_values.options(), LEGACY_CONTIGUOUS_MEMORY_FORMAT);
+      AT_ASSERT(divider_values_expand.is_cuda());
+      auto divider_input_values = at::empty_like(input_values, grad_values.options(), LEGACY_CONTIGUOUS_MEMORY_FORMAT);
+      AT_ASSERT(divider_input_values.is_cuda());
 
       // get 1D indices
       auto grad_sparse_dim_to_keep_v = std::vector<int64_t>(grad_sparse_dim);
@@ -705,7 +714,7 @@ Tensor _sparse_summean_backward_cuda(const Tensor& grad_, const SparseTensor& in
       auto input_indices_pos_ti = getTensorInfo<int64_t, int64_t>(input_indices_pos);
 
       if (mean) {
-        AT_DISPATCH_FLOATING_TYPES_AND_HALF(grad_values.scalar_type(), "_sparse_summean_backward_cuda", [&] {
+        AT_DISPATCH_FLOATING_TYPES_AND_HALF(grad_values.scalar_type(), "_sparse_summean_backward_divider_cuda", [&] {
           auto grad_values_expand_ti = getTensorInfo<scalar_t, int64_t>(grad_values_expand);
           auto divider_values_expand_ti = getTensorInfo<scalar_t, int64_t>(divider_values_expand);
 
@@ -720,9 +729,13 @@ Tensor _sparse_summean_backward_cuda(const Tensor& grad_, const SparseTensor& in
         });
       }
 
-      AT_DISPATCH_FLOATING_TYPES_AND_HALF(grad_values.scalar_type(), "_sparse_summean_backward_cuda", [&] {
+      if (mean) divider_values_expand = at::max(divider_values_expand, at::tensor(1, divider_values_expand.options()));
+
+      AT_DISPATCH_FLOATING_TYPES_AND_HALF(grad_values.scalar_type(), "_sparse_summean_backward_scatter_cuda", [&] {
         auto grad_values_expand_ti = getTensorInfo<scalar_t, int64_t>(grad_values_expand);
         auto grad_input_values_ti = getTensorInfo<scalar_t, int64_t>(grad_input_values);
+        auto divider_values_expand_ti = getTensorInfo<scalar_t, int64_t>(divider_values_expand);
+        auto divider_input_values_ti = getTensorInfo<scalar_t, int64_t>(divider_input_values);
 
         _sparse_summean_backward_scatter_cuda_kernel<scalar_t><<<grid, block, 0, stream>>>(
           total_threads,
@@ -730,9 +743,13 @@ Tensor _sparse_summean_backward_cuda(const Tensor& grad_, const SparseTensor& in
           input_indices_ti,
           input_indices_pos_ti,
           grad_values_expand_ti,
-          grad_input_values_ti
+          grad_input_values_ti,
+          divider_values_expand_ti,
+          divider_input_values_ti
         );
       });
+
+      if (mean) grad_input_values = grad_input_values / divider_input_values;
     }
 
     return at::_sparse_coo_tensor_with_dims_and_tensors(input_sparse_dim, input_dense_dim, input_sizes, input_indices.clone(at::MemoryFormat::Contiguous), grad_input_values, grad.options());
