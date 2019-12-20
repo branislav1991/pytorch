@@ -2192,7 +2192,8 @@ class TestSparse(TestCase):
 
     def test_div_by_sparse_error(self):
         self.assertRaisesRegex(RuntimeError, 'A Sparse Tensor can only be divided',
-                               lambda: torch.tensor(1., device=self.device).to_sparse() / torch.tensor(1., device=self.device).to_sparse())
+                               lambda: torch.tensor(1., device=self.device).to_sparse()
+                               / torch.tensor(1., device=self.device).to_sparse())
 
 
 
