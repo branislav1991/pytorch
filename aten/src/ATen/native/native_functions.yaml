@@ -3020,6 +3020,8 @@
     SparseCPU: norm_sparse
     SparseCUDA: norm_sparse
 
+- func: _sparse_reduce(Tensor self, int[1] dim, int? mode) -> Tensor
+
 # TODO: reduce signatures down to one when optional args is available
 - func: _sparse_sum(Tensor self) -> Tensor
   use_c10_dispatcher: full
@@ -3049,20 +3051,28 @@
 
 - func: _sparse_min.dtype(Tensor self, *, ScalarType dtype) -> Tensor
 
-- func: _sparse_min.dim(Tensor self, int dim) -> Tensor
+- func: _sparse_min.dim(Tensor self, int dim) -> (Tensor values, Tensor indices)
+  use_c10_dispatcher: full
+  dispatch:
+      SparseCPU: _sparse_min_cpu
+      SparseCUDA: _sparse_min_cuda
 
-- func: _sparse_min.dim_dtype(Tensor self, int dim, *, ScalarType dtype) -> Tensor
+- func: _sparse_min.dim_dtype(Tensor self, int dim, *, ScalarType dtype) -> (Tensor values, Tensor indices)
 
 - func: _sparse_max(Tensor self) -> Tensor
   use_c10_dispatcher: full
 
 - func: _sparse_max.dtype(Tensor self, *, ScalarType dtype) -> Tensor
 
-- func: _sparse_max.dim(Tensor self, int dim) -> Tensor
+- func: _sparse_max.dim(Tensor self, int dim) -> (Tensor values, Tensor indices)
+  use_c10_dispatcher: full
+  dispatch:
+      SparseCPU: _sparse_max_cpu
+      SparseCUDA: _sparse_max_cuda
 
-- func: _sparse_max.dim_dtype(Tensor self, int dim, *, ScalarType dtype) -> Tensor
+- func: _sparse_max.dim_dtype(Tensor self, int dim, *, ScalarType dtype) -> (Tensor values, Tensor indices)
 
-- func: _sparse_minmax_backward(Tensor grad, Tensor self, Tensor output, int dim) -> Tensor
+- func: _sparse_minmax_backward(Tensor grad, Tensor self, Tensor indices, int dim) -> Tensor
   dispatch:
       SparseCPU: _sparse_minmax_backward_cpu
       SparseCUDA: _sparse_minmax_backward_cuda

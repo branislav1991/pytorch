@@ -954,11 +954,11 @@
 - name: _sparse_mean.dim(Tensor self, int[1] dim) -> Tensor
   self: at::_sparse_summean_backward(grad, self, dim, true)
 
-- name: _sparse_min.dim(Tensor self, int dim) -> Tensor
-  self: at::_sparse_minmax_backward(grad, self, result, dim)
+- name: _sparse_min.dim(Tensor self, int dim) -> (Tensor values, Tensor indices)
+  self: at::_sparse_minmax_backward(grad, self, indices, dim)
 
-- name: _sparse_max.dim(Tensor self, int dim) -> Tensor
-  self: at::_sparse_minmax_backward(grad, self, result, dim)
+- name: _sparse_max.dim(Tensor self, int dim) -> (Tensor values, Tensor indices)
+  self: at::_sparse_minmax_backward(grad, self, indices, dim)
 
 - name: _standard_gamma(Tensor self, Generator? generator=None) -> Tensor
   self: grad * _standard_gamma_grad(self, result)

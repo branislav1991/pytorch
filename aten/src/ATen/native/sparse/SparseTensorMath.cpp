@@ -1126,7 +1126,7 @@ Tensor _sparse_sum(const SparseTensor& input, IntArrayRef dims_to_sum, ScalarTyp
 }
 
 Tensor _sparse_sum(const SparseTensor& input, IntArrayRef dims_to_sum) {
-  return _sparse_reduce(input, dims_to_sum, 0);
+  return at::_sparse_reduce(input, dims_to_sum, 0);
 }
 
 // --------------------------------------------------------------------
@@ -1147,7 +1147,99 @@ Tensor _sparse_mean(const SparseTensor& input, IntArrayRef dims_to_sum, ScalarTy
 }
 
 Tensor _sparse_mean(const SparseTensor& input, IntArrayRef dims_to_sum) {
-  return _sparse_reduce(input, dims_to_sum, 1);
+  return at::_sparse_reduce(input, dims_to_sum, 1);
+}
+
+LongTensor _sparse_minmax_indices_cpu(const SparseTensor& input_, const Tensor& result_, int64_t dim_to_minmax) {
+  TORCH_CHECK(!input_.is_cuda(), "_sparse_minmax_indices_cpu: expected 'input_' to be CPU tensor, but got CUDA tensor");
+  TORCH_CHECK(!result_.is_cuda(), "_sparse_minmax_indices_cpu: expected 'result_' to be CPU tensor, but got CUDA tensor");
+
+  const int64_t input_dim = input_.dim();
+  dim_to_minmax = maybe_wrap_dim(dim_to_minmax, input_dim);
+
+  int64_t input_sparse_dim = input_.sparse_dim();
+  int64_t input_dense_dim = input_.dense_dim();
+  auto input = input_.coalesce();
+  auto input_values = input._values();
+
+  if (dim_to_minmax < input_sparse_dim && input_sparse_dim == 1) {
+    TORCH_CHECK(!result_.is_sparse(), "_sparse_minmax_indices_cpu: expected result Tensor to be dense since all sparse dims are reduced");
+    auto expand_size = input_values.sizes().vec();
+    auto result_values = result_.expand(expand_size);
+    auto indices = at::nonzero(result_values == input_values).select(1, dim_to_minmax);
+    return indices;
+  }
+
+  TORCH_CHECK(result_.is_sparse(), "_sparse_minmax_indices_cpu: expected grad_ Tensor to be sparse, but got dense");
+  auto result = result_.coalesce();
+  auto result_values = result._values();
+
+  if (dim_to_minmax >= input_sparse_dim) {
+    auto expand_size = input_values.sizes().vec();
+    auto result_values_expand = result_values.expand(expand_size);
+    auto indices = at::nonzero(result_values_expand == input_values).select(1, dim_to_minmax);
+    return indices;
+  }
+  else {
+    const int64_t input_nnz = input._nnz();
+    auto input_indices = input._indices();
+    auto result_indices = result._indices();
+    const int64_t result_sparse_dim = result.sparse_dim();
+    const int64_t result_nnz = result._nnz();
+    const int64_t num_values = input_values.numel();
+
+    at::Tensor minmax_indices = at::zeros_like(result_values, result_indices.options(), LEGACY_CONTIGUOUS_MEMORY_FORMAT);
+
+    // get flatten indices for input and result
+    auto sparse_dims_to_keep_v = std::vector<int64_t>(input_sparse_dim);
+    std::iota(sparse_dims_to_keep_v.begin(), sparse_dims_to_keep_v.end(), 0);
+    sparse_dims_to_keep_v.erase(sparse_dims_to_keep_v.begin() + dim_to_minmax);
+    auto result_sparse_dim_to_keep_v = std::vector<int64_t>(result_sparse_dim);
+    std::iota(result_sparse_dim_to_keep_v.begin(), result_sparse_dim_to_keep_v.end(), 0);
+
+    std::cerr << "Before dispatch" << std::endl;
+
+    AT_DISPATCH_ALL_TYPES(
+      input_values.scalar_type(), "sparse_minmax_indices_cpu", [&] {
+        auto result_indices_1D = flatten_indices_by_dims(result_indices, result.sizes(), result_sparse_dim_to_keep_v); // flatten indices on all sparse_dim of grad, output indices is coalesced and sorted
+        auto result_indices_1D_accessor = result_indices_1D.accessor<int64_t, 1>();
+        auto input_indices_1D = flatten_indices_by_dims(input_indices, input.sizes(), sparse_dims_to_keep_v);
+        auto input_indices_1D_accessor = input_indices_1D.accessor<int64_t, 1>();
+
+        // binary search to find matching extremal indices
+        int64_t blockSize = result_values.stride(0);
+        scalar_t* input_values_ptr = input_values.data_ptr<scalar_t>();
+        scalar_t* result_values_ptr = result_values.data_ptr<scalar_t>();
+
+        std::cerr << "Before binary search" << std::endl;
+
+        for (int64_t i = 0; i < input_nnz; i++) {
+          int64_t input_idx = input_indices_1D_accessor[i];
+          int64_t l = 0, r = result_nnz - 1;
+          while (l <= r) {
+            int64_t m = l + (r - l) / 2;
+            if (result_indices_1D_accessor[m] == input_idx) {
+              scalar_t* input_values_it = input_values_ptr + i * blockSize;
+              scalar_t* result_values_it = result_values_ptr + m * blockSize;
+              auto idx = input_indices[dim_to_minmax][i];
+
+              for (int64_t b = 0; b < blockSize; ++b) {
+                auto ptr = minmax_indices[m].data_ptr<int64_t>();
+                if (std::abs(*(result_values_it + b) - *(input_values_it + b)) < 1e-5) *(ptr + b) = idx.item().to<int64_t>();
+              }
+            }
+            if (result_indices_1D_accessor[m] < input_idx) {
+              l = m + 1;
+            }
+            else {
+              r = m - 1;
+            }
+          }
+        }
+    });
+
+    return minmax_indices;
+  }
 }
 
 // --------------------------------------------------------------------
@@ -1163,12 +1255,14 @@ Tensor _sparse_min(const SparseTensor& input, ScalarType dtype) {
   return input._nnz() > 0 ? input.coalesce().values().min().to(dtype) : input.coalesce().values().sum(dtype);
 }
 
-Tensor _sparse_min(const SparseTensor& input, int64_t dim_to_min, ScalarType dtype) {
+std::tuple<Tensor, LongTensor> _sparse_min(const SparseTensor& input, int64_t dim_to_min, ScalarType dtype) {
   return at::_sparse_min(input.to(dtype), dim_to_min);
 }
 
-Tensor _sparse_min(const SparseTensor& input, int64_t dim_to_min) {
-  return _sparse_reduce(input, dim_to_min, 2);
+std::tuple<Tensor, LongTensor> _sparse_min_cpu(const SparseTensor& input, int64_t dim_to_min) {
+  auto result = at::_sparse_reduce(input, dim_to_min, 2);
+  auto result_indices = _sparse_minmax_indices_cpu(input, result, dim_to_min);
+  return std::make_tuple(result, result_indices);
 }
 
 // --------------------------------------------------------------------
@@ -1184,12 +1278,14 @@ Tensor _sparse_max(const SparseTensor& input, ScalarType dtype) {
   return input._nnz() > 0 ? input.coalesce().values().max().to(dtype) : input.coalesce().values().sum(dtype);
 }
 
-Tensor _sparse_max(const SparseTensor& input, int64_t dim_to_max, ScalarType dtype) {
+std::tuple<Tensor, LongTensor> _sparse_max(const SparseTensor& input, int64_t dim_to_max, ScalarType dtype) {
   return at::_sparse_max(input.to(dtype), dim_to_max);
 }
 
-Tensor _sparse_max(const SparseTensor& input, int64_t dim_to_max) {
-  return _sparse_reduce(input, dim_to_max, 3);
+std::tuple<Tensor, LongTensor> _sparse_max_cpu(const SparseTensor& input, int64_t dim_to_max) {
+  auto result = at::_sparse_reduce(input, dim_to_max, 3);
+  auto result_indices = _sparse_minmax_indices_cpu(input, result, dim_to_max);
+  return std::make_tuple(result, result_indices);
 }
 
 // --------------------------------------------------------------------
@@ -1383,13 +1479,13 @@ Tensor _sparse_summean_backward_cpu(const Tensor& grad_, const SparseTensor& inp
   }
 }
 
-Tensor _sparse_minmax_backward_cpu(const Tensor& grad_, const SparseTensor& input_, const Tensor& result_, int64_t dim_to_minmax) {
+Tensor _sparse_minmax_backward_cpu(const Tensor& grad_, const SparseTensor& input_, const Tensor& indices, int64_t dim_to_minmax) {
   TORCH_CHECK(!grad_.is_cuda(), "_sparse_minmax_backward_cpu: expected 'grad_' to be CPU tensor, but got CUDA tensor");
   TORCH_CHECK(!input_.is_cuda(), "_sparse_minmax_backward_cpu: expected 'input_' to be CPU tensor, but got CUDA tensor");
 
-  auto input = input_.coalesce();
+  Tensor input = input_.coalesce();
   const int64_t input_dim = input.dim();
-  maybe_wrap_dim(dim_to_minmax, input_dim);
+  dim_to_minmax = maybe_wrap_dim(dim_to_minmax, input_dim);
 
   LongTensor input_indices = input._indices();
   Tensor input_values = input._values();
@@ -1398,79 +1494,89 @@ Tensor _sparse_minmax_backward_cpu(const Tensor& grad_, const SparseTensor& inpu
   const int64_t input_dense_dim = input.dense_dim();
   const int64_t input_nnz = input._nnz();
 
-  auto result = result_.coalesce();
-  LongTensor result_indices = result._indices();
-  Tensor result_values = result._values();
-
-  if (dim_to_minmax < input_sparse_dim && input_sparse_dim == 1) {
-    TORCH_CHECK(!grad_.is_sparse(), "_sparse_minmax_backward_cpu: expected grad_ Tensor to be dense since all sparse dims are reduced");
-    auto expand_size = input_values.sizes().vec();
-
-    auto grad_input_values = grad_.expand(expand_size).clone();
-    result_values = result_values.expand(expand_size);
-    grad_input_values.masked_fill_(result_values != input_values, 0);
-    return at::_sparse_coo_tensor_with_dims_and_tensors(input_sparse_dim, input_dense_dim, input_sizes, input_indices.clone(), grad_input_values, input.options().dtype(grad_.dtype())); // convert to grad dtype
+  if (dim_to_minmax >= input_sparse_dim) {
+    TORCH_CHECK(grad_.is_sparse(), "_sparse_minmax_backward_cpu: expected grad_ Tensor to be sparse");
+    Tensor grad = grad_.coalesce();
+    Tensor grad_values = grad._values();
+    int64_t dense_dim_to_minmax = dim_to_minmax - input_sparse_dim + 1;
+    auto grad_input_values = at::zeros_like(input_values, input_values.options());
+    grad_input_values = grad_input_values.scatter(dense_dim_to_minmax, indices.unsqueeze(dense_dim_to_minmax), grad_values.unsqueeze(dense_dim_to_minmax));
+    return at::_sparse_coo_tensor_with_dims_and_tensors(input_sparse_dim, input_dense_dim, input_sizes, input_indices.clone(at::MemoryFormat::Contiguous), grad_input_values, grad.options());
   }
 
-  auto grad = grad_.coalesce();
-  if (dim_to_minmax >= input_sparse_dim) {
-    // summing over dense dimension
+  if (input_sparse_dim == 1) {
+    TORCH_CHECK(!grad_.is_sparse(), "_sparse_minmax_backward_cpu: expected grad_ Tensor to be dense since all sparse dims are reduced");
+    Tensor grad_values = grad_;
+    Tensor grad_input_values = grad_input_values.unsqueeze(0); // add nnz dimension
+
     auto expand_size = input_values.sizes().vec();
-    auto grad_input_values = grad._values();
-    grad_input_values = grad_input_values.unsqueeze(dim_to_minmax - input_sparse_dim);
     grad_input_values = grad_input_values.expand(expand_size).clone();
-    auto result_values_expand = result_values.expand(expand_size);
-    grad_input_values.masked_fill_(input_values != result_values_expand, 0);
-    return at::_sparse_coo_tensor_with_dims_and_tensors(input_sparse_dim, input_dense_dim, input_sizes, input_indices.clone(at::MemoryFormat::Contiguous), grad_input_values, grad.options());
+    auto expanded_indices = indices.expand(expand_size);
+    auto input_minmax_indices = input_indices[dim_to_minmax];
+    for (int64_t i = 1; i < expand_size.size(); ++i) {
+      input_minmax_indices.unsqueeze(i);
+    }
+    input_minmax_indices.expand(expand_size);
+    grad_input_values.masked_fill_(expanded_indices != input_minmax_indices, 0);
+    return at::_sparse_coo_tensor_with_dims_and_tensors(input_sparse_dim, input_dense_dim, input_sizes, indices.clone(at::MemoryFormat::Contiguous), grad_input_values, input.options());
   }
   else {
     TORCH_CHECK(grad_.is_sparse(), "_sparse_minmax_backward_cpu: expected grad_ Tensor to be sparse, but got dense");
     auto grad = grad_.coalesce();
-    LongTensor grad_indices = grad._indices();
+    int64_t grad_sparse_dim = grad.sparse_dim();
+    Tensor grad_indices = grad._indices();
     Tensor grad_values = grad._values();
-    const int64_t grad_sparse_dim = grad.sparse_dim();
-    const int64_t grad_nnz = grad._nnz();
-    const int64_t num_values = input_values.numel();
+    Tensor grad_input_values = at::zeros_like(input_values, input_values.options());
 
-    auto grad_input_values = at::zeros_like(input_values, grad_values.options(), LEGACY_CONTIGUOUS_MEMORY_FORMAT);
+    const int64_t grad_nnz = grad_input_values.size(0);
+    auto input_minmax_indices = input_indices[dim_to_minmax];
+    // auto expand_size = input_values.sizes().vec();
+    // for (int64_t i = 1; i < expand_size.size(); ++i) {
+    //   input_minmax_indices.unsqueeze(i);
+    // }
+    // input_minmax_indices = input_minmax_indices.expand(expand_size); // make these indices the same size as values to compare them to result indices
 
-    // get flatten indices for grad and input
+    // get flatten indices for grad input
     auto sparse_dims_to_keep_v = std::vector<int64_t>(input_sparse_dim);
     std::iota(sparse_dims_to_keep_v.begin(), sparse_dims_to_keep_v.end(), 0);
     sparse_dims_to_keep_v.erase(sparse_dims_to_keep_v.begin() + dim_to_minmax);
     auto grad_sparse_dim_to_keep_v = std::vector<int64_t>(grad_sparse_dim);
     std::iota(grad_sparse_dim_to_keep_v.begin(), grad_sparse_dim_to_keep_v.end(), 0);
 
-    AT_DISPATCH_ALL_TYPES(
-      input_values.scalar_type(), "sparse_minmax", [&] {
-        auto grad_indices_1D = flatten_indices_by_dims(grad_indices, grad.sizes(), grad_sparse_dim_to_keep_v); // flatten indices on all sparse_dim of grad, output indices is coalesced and sorted
-        auto grad_indices_1D_accessor = grad_indices_1D.accessor<int64_t, 1>();
-        auto input_indices_1D = flatten_indices_by_dims(input_indices, input_sizes, sparse_dims_to_keep_v);
-        auto input_indices_1D_accessor = input_indices_1D.accessor<int64_t, 1>();
-
-        // binary search to find matching extremal indices
-        at::parallel_for(0, input_nnz, 0, [&](int64_t start, int64_t end) {
-          for (auto i = start; i < end; i++) {
-            int64_t input_idx = input_indices_1D_accessor[i];
-            int64_t l = 0, r = grad_nnz - 1;
-            while (l <= r) {
-              int64_t m = l + (r - l) / 2;
-              if (grad_indices_1D_accessor[m] == input_idx) {
-                grad_input_values[i] = grad_input_values[i].masked_scatter(result_values[m].isclose(input_values[i]), grad_values[m]);
-              }
-              if (grad_indices_1D_accessor[m] < input_idx) {
-                l = m + 1;
-              }
-              else {
-                r = m - 1;
+    auto grad_indices_1D = flatten_indices_by_dims(grad_indices, grad.sizes(), grad_sparse_dim_to_keep_v); // flatten indices on all sparse_dim of grad, output indices is coalesced and sorted
+    auto grad_indices_1D_accessor = grad_indices_1D.accessor<int64_t, 1>();
+    auto input_indices_1D = flatten_indices_by_dims(input_indices, input_sizes, sparse_dims_to_keep_v);
+    auto input_indices_1D_accessor = input_indices_1D.accessor<int64_t, 1>();
+    
+    // binary search to find matching indices
+    int64_t blockSize = grad_values.stride(0);
+    at::parallel_for(0, input_nnz, 0, [&](int64_t start, int64_t end) {
+      for (auto i = start; i < end; i++) {
+        int64_t input_idx = input_indices_1D_accessor[i];
+        int64_t l = 0, r = grad_nnz - 1;
+        while (l <= r) {
+          int64_t m = l + (r - l) / 2;
+          if (grad_indices_1D_accessor[m] == input_idx) {
+            for (int64_t s = 0; s < blockSize; ++s) {
+              if (indices[m].data<int64_t>()[s] == input_minmax_indices[i].data<int64_t>()[0]) {
+                grad_input_values[i].data<int64_t>()[s] = grad_values[m].data<int64_t>()[0];
               }
             }
+            break;
           }
-        });
+          if (grad_indices_1D_accessor[m] < input_idx) {
+            l = m + 1;
+          }
+          else {
+            r = m - 1;
+          }
+        }
+      }
     });
 
-    return at::_sparse_coo_tensor_with_dims_and_tensors(input_sparse_dim, input_dense_dim, input_sizes, input_indices.clone(at::MemoryFormat::Contiguous), grad_input_values, grad.options());
+    return at::_sparse_coo_tensor_with_dims_and_tensors(input_sparse_dim, input_dense_dim, input_sizes, input_indices.clone(at::MemoryFormat::Contiguous), grad_input_values, input.options());
   }
+
 }
 
 Tensor isnan_sparse(const Tensor & self){

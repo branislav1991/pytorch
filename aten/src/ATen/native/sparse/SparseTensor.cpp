@@ -412,25 +412,25 @@ SparseTensor coalesce_sparse_cpu(const SparseTensor& self, c10::optional<int64_t
           int64_t curr = indicesBufferAccessor[j];
           if (curr == prev) {
             if (values.numel() > 0) {  // if values is an empty tensor, there are no elements to copy
-              scalar_t* valuesIt = values_ptr + pos * blockSize;
-              scalar_t* newValuesIt = newValues_ptr + i * blockSize;
+              scalar_t* values_it = values_ptr + pos * blockSize;
+              scalar_t* newValues_it = newValues_ptr + i * blockSize;
               if (mode == 0) {
-                THBlas_axpy<scalar_t>(blockSize, 1, valuesIt, 1, newValuesIt, 1);
+                THBlas_axpy<scalar_t>(blockSize, 1, values_it, 1, newValues_it, 1);
               }
               else if (mode == 1) { 
                 mean_counter += 1; 
                 for(int64_t b = 0; b < blockSize; ++b) { // paralellize this!
-                  *(newValuesIt + b) += (*(valuesIt + b) - *(newValuesIt + b)) / static_cast<scalar_t>(mean_counter);
+                  *(newValues_it + b) += (*(values_it + b) - *(newValues_it + b)) / static_cast<scalar_t>(mean_counter);
                 }
               }
               else if (mode == 2) {
                 for(int64_t b = 0; b < blockSize; ++b) {
-                  *(newValuesIt + b) = *(valuesIt + b) < *(newValuesIt + b) ? *(valuesIt + b) : *(newValuesIt + b);
+                  *(newValues_it + b) = *(values_it + b) < *(newValues_it + b) ? *(values_it + b) : *(newValues_it + b);
                 }
               } 
               else {
                 for(int64_t b = 0; b < blockSize; ++b) {
-                  *(newValuesIt + b) = *(valuesIt + b) > *(newValuesIt + b) ? *(valuesIt + b) : *(newValuesIt + b);
+                  *(newValues_it + b) = *(values_it + b) > *(newValues_it + b) ? *(values_it + b) : *(newValues_it + b);
                 }
               }
             }

@@ -177,6 +177,9 @@ def min(input, dim=None, dtype=None):
     reduce over all of them. When min over all ``sparse_dim``, this method
     returns a Tensor instead of SparseTensor.
 
+    Additionally, if a dimension is chosen, also returns the index of the minimum
+    element.
+
     All reduced :attr:`dim` are squeezed (see :func:`torch.squeeze`), resulting an output
     tensor having :attr:`dim` fewer dimensions than :attr:`input`.
 
@@ -185,7 +188,7 @@ def min(input, dim=None, dtype=None):
 
     Args:
         input (Tensor): the input SparseTensor
-        dim (int): a dimension or a list of dimensions to reduce. Default: reduce
+        dim (int): a dimension to min over. Default: min
             over all dims.
         dtype (:class:`torch.dtype`, optional): the desired data type of returned Tensor.
             Default: dtype of :attr:`input`.
@@ -210,6 +213,9 @@ def max(input, dim=None, dtype=None):
     reduce over all of them. When max over all ``sparse_dim``, this method
     returns a Tensor instead of SparseTensor.
 
+    Additionally, if a dimension is chosen, also returns the index of the maximum
+    element.
+
     All reduced :attr:`dim` are squeezed (see :func:`torch.squeeze`), resulting an output
     tensor having :attr:`dim` fewer dimensions than :attr:`input`.
 
@@ -218,7 +224,7 @@ def max(input, dim=None, dtype=None):
 
     Args:
         input (Tensor): the input SparseTensor
-        dim (int): a dimension or a list of dimensions to reduce. Default: reduce
+        dim (int): a dimension to max over. Default: max
             over all dims.
         dtype (:class:`torch.dtype`, optional): the desired data type of returned Tensor.
             Default: dtype of :attr:`input`.

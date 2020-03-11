@@ -1152,20 +1152,20 @@ class TestSparse(TestCase):
                 gradcheck(fn_max, (S,), check_sparse_nnz=True)
             else:
                 def fn_min(S):
-                    res = torch.sparse.min(S, td)
+                    res = torch.sparse.min(S, td)[0]
                     if res.is_sparse:
                         res = res.to_dense()
                     return res
                 #FIXME: gradcheck doesn't seem to work for sparse min and max
-                #gradcheck(fn_min, (S,), check_sparse_nnz=True)
+                gradcheck(fn_min, (S,), check_sparse_nnz=True)
 
                 def fn_max(S):
-                    res = torch.sparse.max(S, td)
+                    res = torch.sparse.max(S, td)[0]
                     if res.is_sparse:
                         res = res.to_dense()
                     return res
                 #FIXME: gradcheck doesn't seem to work for sparse min and max
-                #gradcheck(fn_max, (S,), check_sparse_nnz=True)
+                gradcheck(fn_max, (S,), check_sparse_nnz=True)
 
         nnz = 10
         sparse_dims = 2
@@ -1186,10 +1186,10 @@ class TestSparse(TestCase):
         self.assertEqual(torch.tensor([1., 3., 1., 1.5]), torch.sparse.mean(x, dim=0).to_dense())
 
         self.assertEqual(torch.sparse.min(x, dim=0), torch.sparse.min(x, dim=-2))
-        self.assertEqual(torch.tensor([1., 1., 1., 1.]), torch.sparse.min(x, dim=0).to_dense())
+        self.assertEqual(torch.tensor([1., 1., 1., 1.]), torch.sparse.min(x, dim=0)[0].to_dense())
 
         self.assertEqual(torch.sparse.max(x, dim=0), torch.sparse.max(x, dim=-2))
-        self.assertEqual(torch.tensor([1., 5., 1., 2.]), torch.sparse.max(x, dim=0).to_dense())
+        self.assertEqual(torch.tensor([1., 5., 1., 2.]), torch.sparse.max(x, dim=0)[0].to_dense())
 
         # not support SparseTensor.sum(), SparseTensor.mean(), SparseTensor.min(), SparseTensor.max()
         S = self._gen_sparse(sparse_dims, nnz, with_size)[0]
