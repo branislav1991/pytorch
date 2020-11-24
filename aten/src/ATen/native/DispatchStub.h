@@ -3,7 +3,9 @@
 #include <c10/core/Backend.h>
 #include <c10/core/ScalarType.h>
 #include <c10/util/Exception.h>
+
 #include <type_traits>
+#include <atomic>
 
 // Implements instruction set specific function dispatch.
 //
@@ -66,10 +68,14 @@ struct CAFFE2_API DispatchStub<rT (*)(Args...), T> {
   template <typename... ArgTypes>
   rT operator()(DeviceType device_type, ArgTypes&&... args) {
     if (device_type == DeviceType::CPU) {
-      if (!cpu_dispatch_ptr) {
-        cpu_dispatch_ptr = choose_cpu_impl();
+      // Use memory_order_relaxed here since even if two threads race,
+      // they will still compute the same value for cpu_dispatch_ptr.
+      auto fptr = cpu_dispatch_ptr.load(std::memory_order_relaxed);
+      if (!fptr) {
+        fptr = choose_cpu_impl();
+        cpu_dispatch_ptr.store(fptr, std::memory_order_relaxed);
       }
-      return (*cpu_dispatch_ptr)(std::forward<ArgTypes>(args)...);
+      return (*fptr)(std::forward<ArgTypes>(args)...);
     } else if (device_type == DeviceType::CUDA) {
       AT_ASSERTM(cuda_dispatch_ptr, "DispatchStub: missing CUDA kernel");
       return (*cuda_dispatch_ptr)(std::forward<ArgTypes>(args)...);
@@ -103,11 +109,11 @@ struct CAFFE2_API DispatchStub<rT (*)(Args...), T> {
 // Fixing dispatch error in Windows debug builds.
 // See https://github.com/pytorch/pytorch/issues/22681 for more details.
 #if defined(_MSC_VER) && defined(_DEBUG)
-  FnPtr cpu_dispatch_ptr;
+  std::atomic<FnPtr> cpu_dispatch_ptr;
   FnPtr cuda_dispatch_ptr;
   FnPtr hip_dispatch_ptr;
 #else
-  FnPtr cpu_dispatch_ptr = nullptr;
+  std::atomic<FnPtr> cpu_dispatch_ptr{nullptr};
   FnPtr cuda_dispatch_ptr = nullptr;
   FnPtr hip_dispatch_ptr = nullptr;
 #endif

@@ -1,9 +1,9 @@
 ## @package batch_lr_loss
 # Module caffe2.python.layers.batch_lr_loss
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-from __future__ import unicode_literals
+
+
+
+
 
 from caffe2.python import core, schema
 from caffe2.python.layers.layers import (
@@ -212,7 +212,7 @@ class BatchLRLoss(ModelLayer):
             )
 
             prediction = self.input_record.prediction()
-            # focal loss = (y(1-p) + p(1-y))^gamma * orginal LR loss
+            # focal loss = (y(1-p) + p(1-y))^gamma * original LR loss
             # y(1-p) + p(1-y) = y + p - 2 * yp
             y_plus_p = net.Add(
                 [prediction, label],

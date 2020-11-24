@@ -1,3 +1,5 @@
+#pragma once
+
 #include <c10/core/ScalarType.h>
 #include <ATen/ATen.h>
 #include <ATen/ExpandUtils.h>
@@ -5,6 +7,7 @@
 #include <limits>
 #include <sstream>
 #include <cstring>
+#include <cctype>
 
 namespace at { namespace native {
 
@@ -74,8 +77,9 @@ static inline void linearSolveCheckInputs(const Tensor& self, const Tensor& A, c
               " but each b matrix is ", self.size(-2), " by ", self.size(-1));
 }
 
-// Validates input shapes for operations on batches of square matrices (inverse, cholesky, lu, symeig)
+// Validates input shapes for operations on batches of square matrices (inverse, cholesky, symeig)
 static inline void squareCheckInputs(const Tensor& self) {
+  TORCH_CHECK(self.dim() >= 2, "Tensor of matrices must have at least 2 dimensions. ");
   TORCH_CHECK(self.size(-1) == self.size(-2),
               "A must be batches of square matrices, "
               "but they are ", self.size(-1), " by ", self.size(-2), " matrices");
@@ -86,7 +90,7 @@ static inline void squareCheckInputs(const Tensor& self) {
  * this function checks if the computation over all these batches has been
  * successful (info = 0) or not, and report in case of the latter.
  */
-static inline void batchCheckErrors(std::vector<int64_t>& infos, const char* name) {
+static inline void batchCheckErrors(std::vector<int64_t>& infos, const char* name, bool allow_singular=false) {
   for (size_t i = 0; i < infos.size(); i++) {
     auto info = infos[i];
     if (info < 0) {
@@ -94,10 +98,10 @@ static inline void batchCheckErrors(std::vector<int64_t>& infos, const char* nam
     } else if (info > 0) {
       if (strstr(name, "svd")) {
         AT_ERROR(name, ": the updating process of SBDSDC did not converge (error: ", info, ")");
-      } else if (strstr(name, "symeig")) {
+      } else if (strstr(name, "symeig") || strstr(name, "syevd")) {
         AT_ERROR(name, ": For batch ", i, ": the algorithm failed to converge; ", info,
                  " off-diagonal elements of an intermediate tridiagonal form did not converge to zero.");
-      } else {
+      } else if (!allow_singular) {
         AT_ERROR(name, ": For batch ", i, ": U(", info, ",", info, ") is zero, singular U.");
       }
     }
@@ -107,16 +111,16 @@ static inline void batchCheckErrors(std::vector<int64_t>& infos, const char* nam
 /*
  * This is an overloaded case of the previous function for a tensor of infos.
  */
-static inline void batchCheckErrors(const Tensor& infos, const char* name) {
+static inline void batchCheckErrors(const Tensor& infos, const char* name, bool allow_singular=false, int info_per_batch=1) {
   auto batch_size = infos.numel();
   auto infos_cpu = infos.to(at::kCPU);
   auto infos_data = infos_cpu.data_ptr<int>();
   for (int64_t i = 0; i < batch_size; i++) {
     auto info = infos_data[i];
     if (info < 0) {
-      AT_ERROR(name, ": For batch ", i, ": Argument ", -info, " has illegal value");
-    } else if (info > 0) {
-      AT_ERROR(name, ": For batch ", i, ": U(", info, ",", info, ") is zero, singular U.");
+      AT_ERROR(name, ": For batch ", i/info_per_batch, ": Argument ", -info, " has illegal value");
+    } else if (!allow_singular && info > 0) {
+      AT_ERROR(name, ": For batch ", i/info_per_batch, ": U(", info, ",", info, ") is zero, singular U.");
     }
   }
 }
@@ -125,7 +129,7 @@ static inline void batchCheckErrors(const Tensor& infos, const char* name) {
  * Given a info int, obtained after a single operation, this function check if the computation
  * has been successful (info = 0) or not, and report in case of the latter.
  */
-static inline void singleCheckErrors(int64_t info, const char* name) {
+static inline void singleCheckErrors(int64_t info, const char* name, bool allow_singular=false) {
   if (info < 0) {
     AT_ERROR(name, ": Argument ", -info, " has illegal value");
   } else if (info > 0) {
@@ -134,7 +138,7 @@ static inline void singleCheckErrors(int64_t info, const char* name) {
     } else if (strstr(name, "symeig")) {
       AT_ERROR(name, ": the algorithm failed to converge; ", info,
                " off-diagonal elements of an intermediate tridiagonal form did not converge to zero.");
-    } else {
+    } else if (!allow_singular) {
       AT_ERROR(name, ": U(", info, ",", info, ") is zero, singular U.");
     }
   }
@@ -276,6 +280,67 @@ static inline Tensor same_stride_to(const Tensor& original_tensor, const at::Ten
                                       options);
   strided_to.copy_(original_tensor);
   return strided_to;
+}
+
+// Creates a dimension permutation array that can be given to `at::permute()`, which will shift
+// the two specified dimensions to the end of a tensor, without changing the order of
+// the other dimensions. `dim1` will be placed at the very end, and `dim0` will be
+// placed just to the left of it.
+//
+// For instance, given a 4-D tensor, dimensions 1 and 3 can be shifted to the end by
+// calling `create_dim_backshift_permutation(1, 3, 4)`. The resulting vector will
+// be `vec(0, 2, 1, 3)`.
+static inline std::vector<int64_t> create_dim_backshift_permutation(int64_t dim0, int64_t dim1, int64_t ndim) {
+  TORCH_CHECK(
+    (dim0 != dim1) && (dim0 < ndim) && (dim0 >= 0) && (dim1 < ndim) && (dim1 >= 0),
+    "duplicate or invalid dimensions");
+  std::vector<int64_t> permutation(ndim);
+  int64_t cur_permuted_dim = 0;
+  for (int64_t dim_ind = 0; dim_ind < ndim; dim_ind++) {
+    if ((dim_ind != dim0) && (dim_ind != dim1)) {
+      permutation[cur_permuted_dim++] = dim_ind;
+    }
+  }
+  permutation[cur_permuted_dim++] = dim0;
+  permutation[cur_permuted_dim] = dim1;
+  return permutation;
+}
+
+// Creates a dimension permutation array that can be given to `at::permute()`, which
+// will reverse a given permutation.
+// The reverse permutation array is created by swapping the indices and their
+// associated values from the given permutation array.
+static inline std::vector<int64_t> create_reverse_permutation(std::vector<int64_t> permutation) {
+  int64_t ndim = permutation.size();
+  std::vector<int64_t> reverse_permutation(ndim);
+  for (int64_t dim_ind = 0; dim_ind < ndim; dim_ind++) {
+    reverse_permutation[permutation[dim_ind]] = dim_ind;
+  }
+  return reverse_permutation;
+}
+
+// Compute R-work array size for MAGMA/LAPACK cgesdd/zgesdd
+// See https://github.com/Reference-LAPACK/lapack/blob/122506cd8b6ce050a200920c3d4c0b153b150fd8/SRC/cgesdd.f#L186
+static inline int64_t computeLRWorkDim(const char jobz, int64_t m, int64_t n) {
+  auto mn = std::min(m, n);
+  auto mx = std::max(m, n);
+  // These settings are valid for on LAPACK 3.6+
+  if (jobz == 'N') {
+    return 5 * mn;
+  }
+  if (mx > 10 * mn) {
+    return 5 * mn * mn + 5 * mn;
+  }
+  return std::max(5 * mn * mn + 5 * mn, 2 * mx * mn + 2 * mn * mn + mn);
+}
+
+// This function checks whether the uplo argument input is valid
+// Allowed strings are "u", "U", "l", "L"
+static inline void checkUplo(const std::string& uplo) {
+  // To use std::toupper safely with plain chars (or signed chars), the argument should first be converted to unsigned char
+  char uplo_uppercase = static_cast<char>(std::toupper(static_cast<unsigned char>(uplo[0])));
+  TORCH_CHECK(uplo.size() == 1 && (uplo_uppercase == 'U' || uplo_uppercase == 'L'),
+    "Expected UPLO argument to be 'L' or 'U', but got ", uplo);
 }
 
 }}  // namespace at::native

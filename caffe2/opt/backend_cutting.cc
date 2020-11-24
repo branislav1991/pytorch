@@ -264,7 +264,7 @@ void ReplaceSubgraph(
     for (const auto& input : op.input()) {
       if (!tensor_map.count(input)) {
         tensor_map[input] =
-            g->createNode(caffe2::make_unique<nom::repr::Tensor>(input));
+            g->createNode(std::make_unique<nom::repr::Tensor>(input));
       }
 
       auto tensor_node = tensor_map[input];
@@ -274,7 +274,7 @@ void ReplaceSubgraph(
     for (const auto& output : op.output()) {
       if (!tensor_map.count(output)) {
         tensor_map[output] =
-            g->createNode(caffe2::make_unique<nom::repr::Tensor>(output));
+            g->createNode(std::make_unique<nom::repr::Tensor>(output));
       }
       auto tensor_node = tensor_map[output];
       g->createEdge(op_node, tensor_node);
@@ -352,9 +352,13 @@ void DumpGraph(NNGraph* g, const std::string& fname) {
   };
 
   std::ofstream out(fname.c_str());
-  out << nom::converters::convertToDotString(g, nnprinter);
-  out.close();
+  if (out) {
+    out << nom::converters::convertToDotString(g, nnprinter);
+  } else {
+    LOG(ERROR) << "Cannot create nomnigraph dump file: " << fname;
+  }
 }
+
 caffe2::NetDef OptimizeForBackend(
     caffe2::NetDef& net,
     std::function<bool(const caffe2::OperatorDef&)> supports,
@@ -389,7 +393,7 @@ caffe2::NetDef OptimizeForBackend(
     }
   }
 
-  // Find unsupported and supported groups of nodes alernatively
+  // Find unsupported and supported groups of nodes alternatively
   context.frontier.clear();
   context.current_group.clear();
   context.find_supported = false;

@@ -96,7 +96,8 @@ static void im2col_out_cuda_template(
   output.zero_();
 
   // Launch kernel
-  AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.scalar_type(), "im2col_out_cuda", [&] {
+  AT_DISPATCH_FLOATING_AND_COMPLEX_TYPES_AND1(kHalf,
+      input.scalar_type(), "im2col_out_cuda", [&] {
     Tensor input_n;
     Tensor output_n;
 
@@ -172,7 +173,7 @@ Tensor im2col_cuda(
     IntArrayRef dilation,
     IntArrayRef padding,
     IntArrayRef stride) {
-  Tensor output = at::empty_like(input);
+  Tensor output = at::empty_like(input, LEGACY_CONTIGUOUS_MEMORY_FORMAT);
   im2col_out_cuda_template(
       output, input, kernel_size, dilation, padding, stride);
   return output;
@@ -204,7 +205,7 @@ Tensor im2col_backward_cuda(
     IntArrayRef dilation,
     IntArrayRef padding,
     IntArrayRef stride) {
-  Tensor grad_input = at::empty_like(grad_output);
+  Tensor grad_input = at::empty_like(grad_output, LEGACY_CONTIGUOUS_MEMORY_FORMAT);
   im2col_backward_out_cuda_template(
       grad_input,
       grad_output,

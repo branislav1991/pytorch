@@ -4,14 +4,29 @@
 #include <ATen/Dispatch.h>
 #include <ATen/native/TensorIterator.h>
 #include <ATen/native/Fill.h>
+#include <ATen/Utils.h>
 
 namespace at {
 namespace native {
 
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ fill ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
 Tensor& fill_out(Tensor& self, Scalar value) {
-  auto iter = TensorIterator::nullary_op(self);
+  if (self.is_quantized()) {
+    at::Tensor out = at::ones(self.sizes()).to(kFloat) * value;
+    out = out.to(self.device());
+    // Trust the `copy_` to handle the quantization and the boundary chacks.
+    self.copy_(out);
+    return self;
+  }
+  if (self.device() == at::kCPU && self.numel() == 1 && !self.is_complex() && !value.isComplex()) {
+    return at::detail::scalar_fill(self, value);
+  }
+  auto iter = TensorIteratorConfig()
+    .set_check_mem_overlap(false)  // Fill is idempotent, so overlap is okay
+    .check_all_same_dtype(false)
+    .add_output(self)
+    .resize_outputs(false)
+    .build();
   fill_stub(iter.device_type(), iter, value);
   return self;
 }

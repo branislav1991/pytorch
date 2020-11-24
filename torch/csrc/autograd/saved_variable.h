@@ -9,7 +9,7 @@
 
 namespace torch { namespace autograd {
 
-struct Variable;
+using Variable = at::Tensor;
 struct Node;
 
 TORCH_API extern const char* ERR_BACKWARD_TWICE;
@@ -20,6 +20,7 @@ class TORCH_API SavedVariable {
  public:
   SavedVariable() = default;
   SavedVariable(const Variable& variable, bool is_output, bool is_inplace_view=false);
+  SavedVariable(const c10::optional<Variable>& variable, bool is_output, bool is_inplace_view=false);
   SavedVariable(SavedVariable&&) = default;
   SavedVariable& operator=(SavedVariable&&) = default;
 

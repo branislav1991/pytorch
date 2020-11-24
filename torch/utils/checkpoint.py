@@ -1,9 +1,9 @@
-from __future__ import absolute_import, division, print_function, unicode_literals
 import torch
 import warnings
+from typing import Any, Iterable, List, Tuple
 
 
-def detach_variable(inputs):
+def detach_variable(inputs: Tuple[Any, ...]) -> Tuple[torch.Tensor, ...]:
     if isinstance(inputs, tuple):
         out = []
         for inp in inputs:
@@ -20,7 +20,7 @@ def detach_variable(inputs):
             "Only tuple of tensors is supported. Got Unsupported input type: ", type(inputs).__name__)
 
 
-def check_backward_validity(inputs):
+def check_backward_validity(inputs: Iterable[Any]) -> None:
     if not any(inp.requires_grad for inp in inputs if isinstance(inp, torch.Tensor)):
         warnings.warn("None of the inputs have requires_grad=True. Gradients will be None")
 
@@ -32,7 +32,7 @@ def check_backward_validity(inputs):
 # the device of all Tensor args.
 #
 # To consider:  maybe get_device_states and set_device_states should reside in torch/random.py?
-def get_device_states(*args):
+def get_device_states(*args) -> Tuple[List[int], List[torch.Tensor]]:
     # This will not error out if "arg" is a CPU tensor or a non-tensor type because
     # the conditionals short-circuit.
     fwd_gpu_devices = list(set(arg.get_device() for arg in args
@@ -46,7 +46,7 @@ def get_device_states(*args):
     return fwd_gpu_devices, fwd_gpu_states
 
 
-def set_device_states(devices, states):
+def set_device_states(devices, states) -> None:
     for device, state in zip(devices, states):
         with torch.cuda.device(device):
             torch.cuda.set_rng_state(state)
@@ -80,7 +80,7 @@ class CheckpointFunction(torch.autograd.Function):
             raise RuntimeError("Checkpointing is not compatible with .grad(), please use .backward() if possible")
         inputs = ctx.saved_tensors
         # Stash the surrounding rng state, and mimic the state that was
-        # present at this time during forward.  Restore the surrouding state
+        # present at this time during forward.  Restore the surrounding state
         # when we're done.
         rng_devices = []
         if ctx.preserve_rng_state and ctx.had_cuda_in_fwd:
@@ -96,7 +96,19 @@ class CheckpointFunction(torch.autograd.Function):
 
         if isinstance(outputs, torch.Tensor):
             outputs = (outputs,)
-        torch.autograd.backward(outputs, args)
+
+        # run backward() with only tensor that requires grad
+        outputs_with_grad = []
+        args_with_grad = []
+        for i in range(len(outputs)):
+            if outputs[i].requires_grad:
+                outputs_with_grad.append(outputs[i])
+                args_with_grad.append(args[i])
+        if len(outputs_with_grad) == 0:
+            raise RuntimeError(
+                "none of output has requires_grad=True,"
+                " this checkpoint() is not necessary")
+        torch.autograd.backward(outputs_with_grad, args_with_grad)
         grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else inp
                       for inp in detached_inputs)
         return (None, None) + grads
@@ -115,7 +127,7 @@ def checkpoint(function, *args, **kwargs):
     :func:`torch.no_grad` manner, i.e., not storing the intermediate
     activations. Instead, the forward pass saves the inputs tuple and the
     :attr:`function` parameter. In the backwards pass, the saved inputs and
-    :attr:`function` is retreived, and the forward pass is computed on
+    :attr:`function` is retrieved, and the forward pass is computed on
     :attr:`function` again, now tracking the intermediate activations, and then
     the gradients are calculated using these activation values.
 
@@ -129,10 +141,19 @@ def checkpoint(function, *args, **kwargs):
         checkpointed version won't be equivalent, and unfortunately it can't be
         detected.
 
+    .. warning::
+        If checkpointed segment contains tensors detached from the computational
+        graph by `detach()` or `torch.no_grad()`, the backward pass will raise an
+        error. This is because `checkpoint` makes all the outputs require
+        gradients which causes issues when a tensor is defined to have no
+        gradient in the model. To circumvent this, detach the tensors outside of
+        the `checkpoint` function.
+
     .. warning:
         At least one of the inputs needs to have :code:`requires_grad=True` if
         grads are needed for model inputs, otherwise the checkpointed part of the
-        model won't have gradients.
+        model won't have gradients. At least one of the outputs needs to have
+        :code:`requires_grad=True` as well.
 
     Args:
         function: describes what to run in the forward pass of the model or
@@ -155,10 +176,7 @@ def checkpoint(function, *args, **kwargs):
     return CheckpointFunction.apply(function, preserve, *args)
 
 
-# TODO(sublee): When releasing PyTorch 1.3,
-# fix the function signature to not accept variadic arguments.
-# See also: https://github.com/pytorch/pytorch/issues/19260
-def checkpoint_sequential(functions, segments, *inputs, **kwargs):
+def checkpoint_sequential(functions, segments, input, **kwargs):
     r"""A helper function for checkpointing sequential models.
 
     Sequential models execute a list of modules/functions in order
@@ -179,11 +197,15 @@ def checkpoint_sequential(functions, segments, *inputs, **kwargs):
         grads are needed for model inputs, otherwise the checkpointed part of the
         model won't have gradients.
 
+    .. warning:
+        Since PyTorch 1.4, it allows only one Tensor as the input and
+        intermediate outputs, just like :class:`torch.nn.Sequential`.
+
     Args:
         functions: A :class:`torch.nn.Sequential` or the list of modules or
             functions (comprising the model) to run sequentially.
         segments: Number of chunks to create in the model
-        inputs: tuple of Tensors that are inputs to :attr:`functions`
+        input: A Tensor that is input to :attr:`functions`
         preserve_rng_state(bool, optional, default=True):  Omit stashing and restoring
             the RNG state during each checkpoint.
 
@@ -194,31 +216,16 @@ def checkpoint_sequential(functions, segments, *inputs, **kwargs):
         >>> model = nn.Sequential(...)
         >>> input_var = checkpoint_sequential(model, chunks, input_var)
     """
-    # Hack to mix *args with **kwargs in a python 2.7-compliant way
+    # Hack for keyword-only parameter in a python 2.7-compliant way
     preserve = kwargs.pop('preserve_rng_state', True)
     if kwargs:
         raise ValueError("Unexpected keyword arguments: " + ",".join(arg for arg in kwargs))
 
-    # To accept variadic arguments is not consistent with nn.Sequential.
-    # This interface will be changed at PyTorch 1.3.
-    # See also: https://github.com/pytorch/pytorch/issues/19260
-    if not inputs:
-        warnings.warn('Giving no input to checkpoint_sequential has been deprecated, '
-                      'a TypeError will be raised after PyTorch 1.3',
-                      DeprecationWarning)
-    elif len(inputs) > 1:
-        warnings.warn('multiple inputs to checkpoint_sequential has been deprecated, '
-                      'a TypeError will be raised after PyTorch 1.3',
-                      DeprecationWarning)
-
     def run_function(start, end, functions):
-        def forward(*inputs):
+        def forward(input):
             for j in range(start, end + 1):
-                if isinstance(inputs, tuple):
-                    inputs = functions[j](*inputs)
-                else:
-                    inputs = functions[j](inputs)
-            return inputs
+                input = functions[j](input)
+            return input
         return forward
 
     if isinstance(functions, torch.nn.Sequential):
@@ -229,8 +236,6 @@ def checkpoint_sequential(functions, segments, *inputs, **kwargs):
     end = -1
     for start in range(0, segment_size * (segments - 1), segment_size):
         end = start + segment_size - 1
-        inputs = checkpoint(run_function(start, end, functions), *inputs,
-                            preserve_rng_state=preserve)
-        if not isinstance(inputs, tuple):
-            inputs = (inputs,)
-    return run_function(end + 1, len(functions) - 1, functions)(*inputs)
+        input = checkpoint(run_function(start, end, functions), input,
+                           preserve_rng_state=preserve)
+    return run_function(end + 1, len(functions) - 1, functions)(input)

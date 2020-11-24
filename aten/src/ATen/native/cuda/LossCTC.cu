@@ -5,7 +5,7 @@
 // 1. Graves et al: http://www.cs.toronto.edu/~graves/icml_2006.pdf
 // We use the equations from above link, but note that [1] has 1-based indexing and we (of course) use 0-based.
 // Graves et al call the probabilities y, we use log_probs (also calling them inputs)
-// A few optimizations (simmilar to those here, but also some I didn't take) are described in
+// A few optimizations (similar to those here, but also some I didn't take) are described in
 // 2. Minmin Sun: http://on-demand.gputechconf.com/gtc/2016/presentation/s6383-minmin-sun-speech-recognition.pdf
 
 #include <ATen/TensorUtils.h>
@@ -15,6 +15,8 @@
 #include <ATen/ATen.h>
 #include <ATen/Dispatch.h>
 #include <ATen/cuda/CUDAApplyUtils.cuh>
+
+#include <THC/THCAtomics.cuh>
 
 #include <type_traits>
 #include <numeric>
@@ -279,7 +281,7 @@ std::tuple<Tensor, Tensor> ctc_loss_gpu_template(const Tensor& log_probs, const 
                       log_alpha.stride(0), log_alpha.stride(1), log_alpha.stride(2),
                       tg_batch_offsets.data_ptr<int64_t>(), tg_target_stride,
                       batch_size, BLANK);
-  THCudaCheck(cudaGetLastError()); // catch launch errors
+  TORCH_CUDA_KERNEL_LAUNCH_CHECK();
   return std::make_tuple(neg_log_likelihood, log_alpha);
 }
 
@@ -453,7 +455,7 @@ ctc_loss_backward_collect_nonblank_gpu_kernel(scalar_t* __restrict__ gradient_da
 
   for (int64_t t = 0; t < input_length; t++) {
     scalar_t lp = log_probs_data[lp_batch_offset + t * lp_input_stride + lp_char_stride * target];
-    atomicAdd(&gradient_data[gr_batch_offset + t * gr_input_stride + gr_char_stride * target],
+    gpuAtomicAdd(&gradient_data[gr_batch_offset + t * gr_input_stride + gr_char_stride * target],
               -std::exp(log_alpha_data[la_batch_offset + la_input_stride * t + la_target_stride * (s*2+1)]
                         + log_beta_data[lb_batch_offset + lb_input_stride * t + lb_target_stride * (s*2+1)]
                         + nll - lp) * gr);
@@ -605,10 +607,10 @@ Tensor ctc_loss_backward_gpu_template(const Tensor& grad_out, const Tensor& log_
   auto input_lengths_t = at::tensor(input_lengths, targets.options().dtype(kLong));
   tg_batch_offsets = tg_batch_offsets.cuda();
 
-  Tensor log_beta = at::empty_like(log_alpha);
+  Tensor log_beta = at::empty_like(log_alpha, LEGACY_CONTIGUOUS_MEMORY_FORMAT);
   log_beta.fill_(neginf);
 
-  Tensor grad = at::full_like(log_probs, neginf); // initialization for log(sum (alpha beta))
+  Tensor grad = at::full_like(log_probs, neginf, LEGACY_CONTIGUOUS_MEMORY_FORMAT); // initialization for log(sum (alpha beta))
 
   // As above, there may be better configurations to use.
   constexpr int max_threads = std::is_same<scalar_t, float>::value ? 1024 : 896; // we need 72 or so 32 bit registers for double
@@ -631,7 +633,7 @@ Tensor ctc_loss_backward_gpu_template(const Tensor& grad_out, const Tensor& log_
        log_beta.stride(0), log_beta.stride(1), log_beta.stride(2),
        tg_batch_offsets.data_ptr<int64_t>(), tg_target_stride,
        batch_size, BLANK);
-    THCudaCheck(cudaGetLastError()); // catch launch errors
+    TORCH_CUDA_KERNEL_LAUNCH_CHECK();
   }
 
   // Very crude heuristic for what is a small problem., based on linearly regressing problem dimensions on
@@ -641,7 +643,7 @@ Tensor ctc_loss_backward_gpu_template(const Tensor& grad_out, const Tensor& log_
   bool is_large = (2*log_probs.size(0)+(24*batch_size)/10+(2*num_labels)/10) > 450;
   if (is_large) { // large alphabet, large batch
     // this computes the probs, minuend in (16)
-    exp_out(grad, log_probs);
+    at::exp_out(grad, log_probs);
     // now we compute the subtrahend for the blanks. It is a straightforward reduction because we know that
     // blanks are in every other position.
     // maybe we should kernelize this, too.
@@ -688,7 +690,7 @@ Tensor ctc_loss_backward_gpu_template(const Tensor& grad_out, const Tensor& log_
        log_beta.stride(0), log_beta.stride(1), log_beta.stride(2),
        tg_batch_offsets.data_ptr<int64_t>(), tg_target_stride,
        batch_size, num_labels, BLANK, zero_infinity);
-    THCudaCheck(cudaGetLastError()); // catch launch errors
+    TORCH_CUDA_KERNEL_LAUNCH_CHECK();
   } else { // small problem, use naive algorithm
     // Still no block/grid configuration guru...
     int threads_input = max_threads;
@@ -711,7 +713,7 @@ Tensor ctc_loss_backward_gpu_template(const Tensor& grad_out, const Tensor& log_
        log_beta.stride(0), log_beta.stride(1), log_beta.stride(2),
        tg_batch_offsets.data_ptr<int64_t>(), tg_target_stride,
        batch_size, num_labels, BLANK, zero_infinity);
-    THCudaCheck(cudaGetLastError()); // catch launch errors
+    TORCH_CUDA_KERNEL_LAUNCH_CHECK(); // catch launch errors
   }
 
   // zero those invalid graident elements due to padding
@@ -735,7 +737,7 @@ Tensor ctc_loss_backward_gpu_template(const Tensor& grad_out, const Tensor& log_
       grad.size(1),
       grad.size(2)
     );
-    THCudaCheck(cudaGetLastError());
+    TORCH_CUDA_KERNEL_LAUNCH_CHECK();
   }
 
   return grad;
@@ -756,6 +758,9 @@ std::tuple<Tensor, Tensor> ctc_loss_gpu(const Tensor& log_probs, const Tensor& t
 
 Tensor ctc_loss_backward_gpu(const Tensor& grad, const Tensor& log_probs, const Tensor& targets, IntArrayRef input_lengths, IntArrayRef target_lengths,
                              const Tensor& neg_log_likelihood, const Tensor& log_alpha, int64_t BLANK, bool zero_infinity) {
+  // See Note [Writing Nondeterministic Operations]
+  // Nondeterministic because of atomicAdd usage
+  globalContext().alertNotDeterministic("ctc_loss_backward_gpu");
   return AT_DISPATCH_FLOATING_TYPES(log_probs.scalar_type(), "ctc_loss_backward_cuda", [&] {
       if (targets.scalar_type() == kLong) {
         return ctc_loss_backward_gpu_template<scalar_t, kLong>(grad, log_probs, targets, input_lengths, target_lengths, neg_log_likelihood, log_alpha, BLANK, zero_infinity);

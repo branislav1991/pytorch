@@ -2,11 +2,9 @@
 #include <ATen/NativeFunctions.h>
 
 #include <ATen/NamedTensorUtils.h>
-#include <ATen/core/EnableNamedTensor.h>
 
 #include <bitset>
 
-#ifdef BUILD_NAMEDTENSOR
 namespace at { namespace native {
 
 Tensor& rename_(Tensor& self, optional<DimnameList> names) {
@@ -190,7 +188,7 @@ Tensor align_to(const Tensor& tensor, DimnameList order, int64_t ellipsis_idx) {
   // appears in the jth element of tensor.
   std::vector<int64_t> tensor_idx_for(order.size(), not_found);
 
-  for (auto order_idx = 0; order_idx < order.size(); ++order_idx) {
+  for (auto order_idx = 0U; order_idx < order.size(); ++order_idx) {
     const auto name = order[order_idx];
     TORCH_CHECK(name.isBasic(),
         "align_to: the desired order of dimensions cannot contain a None name, got ",
@@ -220,7 +218,7 @@ Tensor align_to(const Tensor& tensor, DimnameList order, int64_t ellipsis_idx) {
   };
 
   // Fill in the non-ellipsis dimensions
-  for (auto order_idx = 0; order_idx < order.size(); ++order_idx) {
+  for (auto order_idx = 0U; order_idx < order.size(); ++order_idx) {
     auto out_idx = order_idx;
     if (order_idx >= ellipsis_idx) {
       out_idx = order_idx + num_ellipsis_names;
@@ -235,7 +233,7 @@ Tensor align_to(const Tensor& tensor, DimnameList order, int64_t ellipsis_idx) {
   }
 
   // Fill in the ellipsis dimensions
-  for (auto tensor_idx = 0; tensor_idx < tensor_dim; ++tensor_idx) {
+  for (auto tensor_idx = 0U; tensor_idx < tensor_dim; ++tensor_idx) {
     if (order_has_tensor_name.test(tensor_idx)) {
       continue;
     }
@@ -261,7 +259,7 @@ Tensor align_to(const Tensor& tensor, DimnameList names) {
   std::vector<int64_t> new_sizes(names.size(), 1);
   std::vector<int64_t> new_strides(names.size(), 0);
 
-  for (auto idx = 0; idx < tensor_names.size(); ++idx) {
+  for (auto idx = 0U; idx < tensor_names.size(); ++idx) {
     const auto& dim = tensor_names[idx];
     TORCH_CHECK(dim.isBasic(),
         "align_to: All input dims must be named. Found unnamed dim at index ",
@@ -305,47 +303,6 @@ std::vector<Tensor> align_tensors(TensorList tensors) {
   return align_tensors_to(tensors, longest_dim->names());
 }
 
-static int64_t cumprod(IntArrayRef sizes) {
-  int64_t result = 1;
-  for (auto size : sizes) {
-    result *= size;
-  }
-  return result;
-}
-
-Tensor unflatten(const Tensor& self, int64_t dim, IntArrayRef sizes, DimnameList names) {
-  // unflatten is implemented only as a python method on tensor right now.
-  // The following asserts should be checked by the python method.
-  TORCH_INTERNAL_ASSERT(names.size() == sizes.size());
-  TORCH_INTERNAL_ASSERT(sizes.size() > 0);
-  TORCH_CHECK(
-      cumprod(sizes) == self.size(dim),
-      "unflatten: Provided names ", names, " and sizes ", sizes, " but sizes don't multiply "
-      "up to the size of dim ", dim, " (", self.names()[dim], ": ", self.size(dim),
-      ") in Tensor", self.names());
-
-  auto outnames = self.names().vec();
-  outnames.erase(outnames.begin() + dim);
-  outnames.insert(outnames.begin() + dim, names.begin(), names.end());
-
-  auto new_sizes = self.sizes().vec();
-  new_sizes.erase(new_sizes.begin() + dim);
-  new_sizes.insert(new_sizes.begin() + dim, sizes.begin(), sizes.end());
-
-  Tensor result;
-  {
-    NoNamesGuard guard;
-    result = self.view(new_sizes);
-  }
-  at::internal_set_names_inplace(result, outnames);
-  return result;
-}
-
-Tensor unflatten(const Tensor& self, Dimname dim, IntArrayRef sizes, DimnameList names) {
-  return native::unflatten(self, dimname_to_position(self, dim), sizes, names);
-}
-
-#ifdef BUILD_NAMEDTENSOR
 // Misc. Dimname overloads that don't have homes. Maybe we should move
 // all of them here or autogenerate them because they look so similar.
 Tensor gather(const Tensor& self, Dimname dim, const Tensor& index, bool sparse_grad) {
@@ -415,7 +372,5 @@ Tensor squeeze(const Tensor& self, Dimname dim) {
   return at::squeeze(self, dimname_to_position(self, dim));
 }
 
-#endif
 
 }}  // namespace at::native
-#endif

@@ -71,9 +71,9 @@ A **binary configuration** is a collection of
 * release or nightly
     * releases are stable, nightlies are beta and built every night
 * python version
-    * linux: 2.7m, 2.7mu, 3.5m, 3.6m 3.7m (mu is wide unicode or something like that. It usually doesn't matter but you should know that it exists)
-    * macos: 2.7, 3.5, 3.6, 3.7
-    * windows: 3.5, 3.6, 3.7
+    * linux: 3.5m, 3.6m 3.7m (mu is wide unicode or something like that. It usually doesn't matter but you should know that it exists)
+    * macos: 3.6, 3.7, 3.8
+    * windows: 3.6, 3.7, 3.8
 * cpu version
     * cpu, cuda 9.0, cuda 10.0
     * The supported cuda versions occasionally change
@@ -178,8 +178,7 @@ CircleCI creates a  final yaml file by inlining every <<* segment, so if we were
 So, CircleCI has several executor types: macos, machine, and docker are the ones we use. The 'machine' executor gives you two cores on some linux vm. The 'docker' executor gives you considerably more cores (nproc was 32 instead of 2 back when I tried in February). Since the dockers are faster, we try to run everything that we can in dockers. Thus
 
 * linux build jobs use the docker executor. Running them on the docker executor was at least 2x faster than running them on the machine executor
-* linux test jobs use the machine executor and spin up their own docker. Why this nonsense? It's cause we run nvidia-docker for our GPU tests; any code that calls into the CUDA runtime needs to be run on nvidia-docker. To run a nvidia-docker you need to install some nvidia packages on the host machine and then call docker with the '—runtime nvidia' argument. CircleCI doesn't support this, so we have to do it ourself.
-    * This is not just a mere inconvenience. **This blocks all of our linux tests from using more than 2 cores.** But there is nothing that we can do about it, but wait for a fix on circleci's side. Right now, we only run some smoke tests (some simple imports) on the binaries, but this also affects non-binary test jobs.
+* linux test jobs use the machine executor in order for them to properly interface with GPUs since docker executors cannot execute with attached GPUs
 * linux upload jobs use the machine executor. The upload jobs are so short that it doesn't really matter what they use
 * linux smoke test jobs use the machine executor for the same reason as the linux test jobs
 
@@ -340,12 +339,12 @@ Libtorch packages are built in the wheel build scripts: manywheel/build_*.sh for
 
 All linux builds occur in docker images. The docker images are
 
-* soumith/conda-cuda
+* pytorch/conda-cuda
     * Has ALL CUDA versions installed. The script pytorch/builder/conda/switch_cuda_version.sh sets /usr/local/cuda to a symlink to e.g. /usr/local/cuda-10.0 to enable different CUDA builds
     * Also used for cpu builds
-* soumith/manylinux-cuda90
-* soumith/manylinux-cuda92
-* soumith/manylinux-cuda100
+* pytorch/manylinux-cuda90
+* pytorch/manylinux-cuda92
+* pytorch/manylinux-cuda100
     * Also used for cpu builds
 
 The Dockerfiles are available in pytorch/builder, but there is no circleci job or script to build these docker images, and they cannot be run locally (unless you have the correct local packages/paths). Only Soumith can build them right now.
@@ -411,7 +410,7 @@ You can build Linux binaries locally easily using docker.
 
 ```
 # Run the docker
-# Use the correct docker image, soumith/conda-cuda used here as an example
+# Use the correct docker image, pytorch/conda-cuda used here as an example
 #
 # -v path/to/foo:path/to/bar makes path/to/foo on your local machine (the
 #    machine that you're running the command on) accessible to the docker
@@ -419,14 +418,12 @@ You can build Linux binaries locally easily using docker.
 #    in the docker container then you will see path/to/foo/baz on your local
 #    machine. You could also clone the pytorch and builder repos in the docker.
 #
-# If you're building a CUDA binary then use `nvidia-docker run` instead, see below.
-#
 # If you know how, add ccache as a volume too and speed up everything
 docker run \
     -v your/pytorch/repo:/pytorch \
     -v your/builder/repo:/builder \
     -v where/you/want/packages/to/appear:/final_pkgs \
-    -it soumith/conda-cuda /bin/bash
+    -it pytorch/conda-cuda /bin/bash
 
 # Export whatever variables are important to you. All variables that you'd
 # possibly need are in .circleci/scripts/binary_populate_env.sh
@@ -444,9 +441,7 @@ export DESIRED_CUDA=cpu
 
 **Building CUDA binaries on docker**
 
-To build a CUDA binary you need to use `nvidia-docker run` instead of just `docker run` (or you can manually pass `--runtime=nvidia`). This adds some needed libraries and things to build CUDA stuff.
-
-You can build CUDA binaries on CPU only machines, but you can only run CUDA binaries on CUDA machines. This means that you can build a CUDA binary on a docker on your laptop if you so choose (though it’s gonna take a loong time).
+You can build CUDA binaries on CPU only machines, but you can only run CUDA binaries on CUDA machines. This means that you can build a CUDA binary on a docker on your laptop if you so choose (though it’s gonna take a long time).
 
 For Facebook employees, ask about beefy machines that have docker support and use those instead of your laptop; it will be 5x as fast.
 
@@ -466,7 +461,7 @@ But if you want to try, then I’d recommend
 # Always install miniconda 3, even if building for Python <3
 new_conda="~/my_new_conda"
 conda_sh="$new_conda/install_miniconda.sh"
-curl -o "$conda_sh" https://repo.continuum.io/miniconda/Miniconda3-latest-MacOSX-x86_64.sh
+curl -o "$conda_sh" https://repo.anaconda.com/miniconda/Miniconda3-latest-MacOSX-x86_64.sh
 chmod +x "$conda_sh"
 "$conda_sh" -b -p "$MINICONDA_ROOT"
 rm -f "$conda_sh"

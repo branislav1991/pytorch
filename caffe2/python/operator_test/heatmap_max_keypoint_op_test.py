@@ -1,7 +1,7 @@
-from __future__ import division
-from __future__ import absolute_import
-from __future__ import print_function
-from __future__ import unicode_literals
+
+
+
+
 
 import numpy as np
 import torch
@@ -45,7 +45,7 @@ class TestHeatmapMaxKeypointOp(hu.HypothesisTestCase):
         # initial coordinates and interpolate HEATMAP_SIZE from it
         HEATMAP_SMALL_SIZE = 4
         bboxes_in = 500 * np.random.rand(NUM_TEST_ROI, 4).astype(np.float32)
-        # only bbox with smaller first coordiantes
+        # only bbox with smaller first coordinates
         for i in range(NUM_TEST_ROI):
             if bboxes_in[i][0] > bboxes_in[i][2]:
                 tmp = bboxes_in[i][2]
@@ -56,7 +56,7 @@ class TestHeatmapMaxKeypointOp(hu.HypothesisTestCase):
                 bboxes_in[i][3] = bboxes_in[i][1]
                 bboxes_in[i][1] = tmp
 
-        # initial randomized coordiantes for heatmaps and expand it with interpolation
+        # initial randomized coordinates for heatmaps and expand it with interpolation
         init = np.random.rand(
             NUM_TEST_ROI,
             NUM_KEYPOINTS,

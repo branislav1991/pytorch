@@ -1,9 +1,12 @@
+#include <chrono>
+
 #include <c10d/FileStore.hpp>
 #include <c10d/ProcessGroupNCCL.hpp>
 #include <c10d/test/CUDATest.hpp>
 #include <c10d/test/TestUtils.hpp>
-#include <gtest/gtest.h>
 #include <torch/csrc/cuda/nccl.h>
+
+#include <gtest/gtest.h>
 
 using namespace c10d::test;
 
@@ -13,8 +16,10 @@ class WorkNCCLSimulateErrors : public c10d::ProcessGroupNCCL::WorkNCCL {
  public:
   WorkNCCLSimulateErrors(
       const std::vector<at::Device>& devices,
-      bool simulate_error)
-      : WorkNCCL(devices), simulate_error_(simulate_error) {}
+      bool simulate_error,
+      int rank,
+      c10d::OpType opType)
+      : WorkNCCL(devices, rank, opType), simulate_error_(simulate_error) {}
 
   std::exception_ptr checkForNCCLErrors(
       const std::vector<std::shared_ptr<c10d::NCCLComm>>& ncclComms)
@@ -32,10 +37,11 @@ class WorkNCCLSimulateErrors : public c10d::ProcessGroupNCCL::WorkNCCL {
 class ProcessGroupNCCLSimulateErrors : public c10d::ProcessGroupNCCL {
  public:
   ProcessGroupNCCLSimulateErrors(
-      const std::shared_ptr<c10d::Store>& store,
+      const c10::intrusive_ptr<c10d::Store>& store,
       int rank,
-      int size)
-      : ProcessGroupNCCL(store, rank, size), simulate_error_(false) {}
+      int size,
+      c10::intrusive_ptr<c10d::ProcessGroupNCCL::Options> opts)
+      : ProcessGroupNCCL(store, rank, size, opts), simulate_error_(false) {}
 
   std::exception_ptr checkForNCCLErrors(
       const std::vector<std::shared_ptr<c10d::NCCLComm>>& ncclComms) override {
@@ -50,9 +56,13 @@ class ProcessGroupNCCLSimulateErrors : public c10d::ProcessGroupNCCL {
         ProcessGroupNCCLSimulateErrors::kWatchdogThreadSleepMillis);
   }
 
-  std::shared_ptr<ProcessGroupNCCL::WorkNCCL> initWork(
-      std::vector<at::Device> devices) override {
-    return std::make_shared<WorkNCCLSimulateErrors>(devices, simulate_error_);
+  c10::intrusive_ptr<ProcessGroupNCCL::WorkNCCL> initWork(
+      std::vector<at::Device> devices,
+      int rank,
+      c10d::OpType opType,
+      const char* profilingTitle) override {
+    return c10::make_intrusive<WorkNCCLSimulateErrors>(
+        devices, simulate_error_, rank, opType);
   }
 
   size_t getNCCLCommCacheSize() {
@@ -71,25 +81,79 @@ class ProcessGroupNCCLSimulateErrors : public c10d::ProcessGroupNCCL {
   bool simulate_error_;
 };
 
+class WorkNCCLTimedoutErrors : public c10d::ProcessGroupNCCL::WorkNCCL {
+ public:
+  WorkNCCLTimedoutErrors(
+      const std::vector<at::Device>& devices,
+      bool set_timedout_error,
+      int rank,
+      c10d::OpType opType)
+      : WorkNCCL(devices, rank, opType),
+        set_timedout_error_(set_timedout_error) {}
+
+ private:
+  bool isCompleted() override {
+    if (set_timedout_error_) {
+      return false;
+    }
+    return c10d::ProcessGroupNCCL::WorkNCCL::isCompleted();
+  }
+
+ private:
+  bool set_timedout_error_;
+};
+
+class ProcessGroupNCCLTimedOutErrors : public ProcessGroupNCCLSimulateErrors {
+ public:
+  ProcessGroupNCCLTimedOutErrors(
+      const c10::intrusive_ptr<c10d::Store>& store,
+      int rank,
+      int size,
+      c10::intrusive_ptr<c10d::ProcessGroupNCCL::Options> opts)
+      : ProcessGroupNCCLSimulateErrors(store, rank, size, opts),
+        set_timedout_error_(false) {}
+
+  c10::intrusive_ptr<ProcessGroupNCCL::WorkNCCL> initWork(
+      std::vector<at::Device> devices,
+      int rank,
+      c10d::OpType opType,
+      const char* profilingTitle) override {
+    return c10::make_intrusive<WorkNCCLTimedoutErrors>(
+        devices, set_timedout_error_, rank, opType);
+  }
+
+  void set_timedout_error() {
+    set_timedout_error_ = true;
+  }
+
+  void reset_timedout_error() {
+    set_timedout_error_ = false;
+  }
+
+ private:
+  bool set_timedout_error_;
+};
+
 class ProcessGroupNCCLErrorsTest : public ::testing::Test {
  protected:
-  std::pair<bool, std::string> skipTest() {
+  bool skipTest() {
     if (cudaNumDevices() == 0) {
-      return std::make_pair(true, "Skipping test since CUDA is not available");
+      LOG(INFO) << "Skipping test since CUDA is not available";
+      return true;
     }
 #ifdef USE_C10D_NCCL
-    return torch::cuda::nccl::version() < kNcclErrorHandlingVersion
-        ? std::make_pair(true, "Skipping test since NCCL version is too old")
-        : std::make_pair(false, "");
-#else
-    return std::make_pair(false, "");
+    if (torch::cuda::nccl::version() < kNcclErrorHandlingVersion) {
+      LOG(INFO) << "Skipping test since NCCL version is too old";
+      return true;
+    }
 #endif
+    return false;
   }
 
   void SetUp() override {
     size_t numDevices = cudaNumDevices();
     TemporaryFile file;
-    store_ = std::make_shared<::c10d::FileStore>(file.path, 1);
+    store_ = c10::make_intrusive<::c10d::FileStore>(file.path, 1);
 
     at::cuda::OptionalCUDAGuard deviceGuard;
     tensors_.resize(numDevices);
@@ -104,20 +168,19 @@ class ProcessGroupNCCLErrorsTest : public ::testing::Test {
   }
 
   std::vector<at::Tensor> tensors_;
-  std::shared_ptr<::c10d::FileStore> store_;
+  c10::intrusive_ptr<::c10d::FileStore> store_;
 };
 
 TEST_F(ProcessGroupNCCLErrorsTest, testNCCLErrorsBlocking) {
-  bool skip;
-  std::string skipReason;
-  std::tie(skip, skipReason) = skipTest();
-  if (skip) {
-    LOG(INFO) << skipReason;
+  if (skipTest()) {
     return;
   }
 
   ASSERT_TRUE(setenv(c10d::NCCL_BLOCKING_WAIT, "1", 1) == 0);
-  ProcessGroupNCCLSimulateErrors pg(store_, 0, 1);
+  auto options = c10d::ProcessGroupNCCL::Options::create();
+  options->opTimeout = std::chrono::milliseconds(1000);
+  ProcessGroupNCCLSimulateErrors pg(
+      store_, 0, 1, options);
 
   auto work = pg.allreduce(tensors_);
   work->wait();
@@ -134,28 +197,42 @@ TEST_F(ProcessGroupNCCLErrorsTest, testNCCLErrorsBlocking) {
   EXPECT_FALSE(work->isSuccess());
   EXPECT_THROW(work->wait(), std::runtime_error);
 
-  // Should remove the nccl communicators which hit errors from the cache.
-  std::this_thread::sleep_for(2 * pg.getWatchdogSleepInterval());
-  EXPECT_EQ(0, pg.getNCCLCommCacheSize());
-
-  // Verify we can recover from errors.
-  pg.reset_error();
-  work = pg.allreduce(tensors_);
-  work->wait();
-  EXPECT_TRUE(work->isSuccess());
-  EXPECT_EQ(1, pg.getNCCLCommCacheSize());
+  // Communicators might be aborted here, further operations would fail.
 }
 
-TEST_F(ProcessGroupNCCLErrorsTest, testNCCLErrorsNonBlocking) {
-  bool skip;
-  std::string skipReason;
-  std::tie(skip, skipReason) = skipTest();
-  if (skip) {
-    LOG(INFO) << skipReason;
+TEST_F(ProcessGroupNCCLErrorsTest, testNCCLTimedoutErrorsBlocking) {
+  if (skipTest()) {
     return;
   }
 
-  ProcessGroupNCCLSimulateErrors pg(store_, 0, 1);
+  ASSERT_TRUE(setenv(c10d::NCCL_BLOCKING_WAIT, "1", 1) == 0);
+  auto options = c10d::ProcessGroupNCCL::Options::create();
+  options->opTimeout = std::chrono::milliseconds(3000);
+  ProcessGroupNCCLTimedOutErrors pg(
+      store_, 0, 1, options);
+
+  auto work = pg.allreduce(tensors_);
+  work->wait();
+  EXPECT_TRUE(work->isSuccess());
+  EXPECT_EQ(1, pg.getNCCLCommCacheSize());
+
+  // Now run all reduce with errors.
+  pg.set_timedout_error();
+  work = pg.allreduce(tensors_);
+  EXPECT_THROW(work->wait(), std::runtime_error);
+
+  // Communicators might be aborted here, further operations would fail.
+}
+
+TEST_F(ProcessGroupNCCLErrorsTest, testNCCLErrorsNonBlocking) {
+  if (skipTest()) {
+    return;
+  }
+
+  auto options = c10d::ProcessGroupNCCL::Options::create();
+  options->opTimeout = std::chrono::milliseconds(3000);
+  ProcessGroupNCCLSimulateErrors pg(
+      store_, 0, 1, options);
 
   auto work = pg.allreduce(tensors_);
   pg.barrier()->wait();
@@ -174,14 +251,5 @@ TEST_F(ProcessGroupNCCLErrorsTest, testNCCLErrorsNonBlocking) {
   EXPECT_TRUE(work->isCompleted());
   EXPECT_FALSE(work->isSuccess());
 
-  // Should remove the nccl communicators which hit errors from the cache.
-  std::this_thread::sleep_for(2 * pg.getWatchdogSleepInterval());
-  EXPECT_EQ(0, pg.getNCCLCommCacheSize());
-
-  // Verify we can recover from errors.
-  pg.reset_error();
-  work = pg.allreduce(tensors_);
-  pg.barrier()->wait();
-  EXPECT_TRUE(work->isSuccess());
-  EXPECT_EQ(1, pg.getNCCLCommCacheSize());
+  // Communicators might be aborted here, further operations would fail.
 }

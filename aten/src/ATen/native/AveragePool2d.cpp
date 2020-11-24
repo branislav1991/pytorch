@@ -58,6 +58,11 @@ static void avg_pool2d_out_frame(
             hend = std::min(hend, inputHeight);
             wend = std::min(wend, inputWidth);
 
+            if (hstart >= hend || wstart >= wend) {
+              ++ptr_output;
+              continue;
+            }
+
             scalar_t sum = 0;
 
             int divide_factor;
@@ -408,7 +413,7 @@ Tensor avg_pool2d_backward_cpu(
   bool count_include_pad,
   c10::optional<int64_t> divisor_override)
 {
-  auto gradInput = at::zeros_like(input);
+  auto gradInput = at::zeros_like(input, LEGACY_CONTIGUOUS_MEMORY_FORMAT);
   avg_pool2d_backward_out_cpu_template(
     gradInput,
     gradOutput_,

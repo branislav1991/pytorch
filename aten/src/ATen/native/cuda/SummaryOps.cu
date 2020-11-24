@@ -2,6 +2,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/CUDAApplyUtils.cuh>
 
+#include <THC/THCAtomics.cuh>
 #include <THC/THCNumerics.cuh>
 
 namespace at {
@@ -74,7 +75,7 @@ __global__ void kernelHistogram1D(
       if (bVal >= minvalue && bVal <= maxvalue) {
         // Use value at `b` as an offset of `smem`
         const IndexType bin = getBin<input_t, IndexType>(bVal, minvalue, maxvalue, nbins);
-        atomicAdd(&smem[bin], getOp(linearIndex));
+        gpuAtomicAdd(&smem[bin], getOp(linearIndex));
       }
     }
     __syncthreads();
@@ -84,7 +85,7 @@ __global__ void kernelHistogram1D(
     for (IndexType i = threadIdx.x; i < a.sizes[0]; i += blockDim.x) {
       const IndexType aOffset =
           detail::IndexToOffset<output_t, IndexType, ADims>::get(i, a);
-      atomicAdd(&a.data[aOffset], smem[i]);
+      gpuAtomicAdd(&a.data[aOffset], smem[i]);
     }
 
   } else if (MemoryType == CUDAHistogramMemoryType::MULTI_BLOCK) {
@@ -103,7 +104,7 @@ __global__ void kernelHistogram1D(
         const IndexType pIdx = p.strides[0] * blockIdx.x + bin;
         const IndexType pOffset =
             detail::IndexToOffset<output_t, IndexType, PDims>::get(pIdx, p);
-        atomicAdd(&p.data[pOffset], getOp(linearIndex));
+        gpuAtomicAdd(&p.data[pOffset], getOp(linearIndex));
       }
     }
     __syncthreads();
@@ -116,7 +117,7 @@ __global__ void kernelHistogram1D(
     for (IndexType i = threadIdx.x; i < a.sizes[0]; i += blockDim.x) {
       const IndexType aOffset =
           detail::IndexToOffset<output_t, IndexType, ADims>::get(i, a);
-      atomicAdd(&a.data[aOffset], p.data[pOffset + i]);
+      gpuAtomicAdd(&a.data[aOffset], p.data[pOffset + i]);
     }
 
   } else {
@@ -133,7 +134,7 @@ __global__ void kernelHistogram1D(
         const IndexType bin = getBin<input_t, IndexType>(bVal, minvalue, maxvalue, nbins);
         const IndexType aOffset =
             detail::IndexToOffset<output_t, IndexType, ADims>::get(bin, a);
-        atomicAdd(&a.data[aOffset], getOp(linearIndex));
+        gpuAtomicAdd(&a.data[aOffset], getOp(linearIndex));
       }
     }
   }
@@ -146,7 +147,7 @@ __global__ void kernelHistogram1D(
          SHARED_MEM,                                                       \
          getCurrentCUDAStream()>>>(                    \
           aInfo, pInfo, bInfo, nbins, minvalue, maxvalue, totalElements, WEIGHTS_OP);        \
-  AT_ASSERTM(cudaGetLastError() == cudaSuccess, "kernelHistogram1D failed");
+  TORCH_INTERNAL_ASSERT(cudaGetLastError() == cudaSuccess, "kernelHistogram1D failed");
 
 #define HANDLE_SWITCH_CASE(mType, getOp)                                   \
   switch (mType) {                                                         \
@@ -164,7 +165,7 @@ inline int64_t getFreeGlobalMemory() {
   // no need to use `cudaSetDevice`
   size_t free_mem, total_mem;
   cudaMemGetInfo(&free_mem, &total_mem);
-  AT_ASSERTM(
+  TORCH_INTERNAL_ASSERT(
       cudaGetLastError() == cudaSuccess,
       "CUDA_tensor_histogram failed to get free global memory");
   return static_cast<int64_t>(free_mem);
@@ -204,6 +205,10 @@ bool CUDA_tensor_histogram(
     checkBackend("CUDA_tensor_histogram", {c}, Backend::CUDA);
   }
   auto totalElements = b.numel();
+
+  if (totalElements == 0) {
+    return false;
+  }
 
   const dim3 block = getApplyBlock();
   dim3 grid;
@@ -359,6 +364,9 @@ Tensor _bincount_cuda(
     const Tensor& self,
     const Tensor& weights,
     int64_t minlength) {
+  // See Note [Writing Nondeterministic Operations]
+  // Nondeterministic because of atomicAdd usage
+  globalContext().alertNotDeterministic("_bincount_cuda");
   return AT_DISPATCH_INTEGRAL_TYPES(self.scalar_type(), "bincount_cuda", [&] {
     const auto scalar = weights.scalar_type();
     if (scalar == ScalarType::Undefined || scalar == ScalarType::Float)
@@ -376,6 +384,9 @@ Tensor _histc_cuda(
   if (self.scalar_type() == ScalarType::Half) {
     AT_ERROR("HalfTensor is not supported");
   }
+  // See Note [Writing Nondeterministic Operations]
+  // Nondeterministic because of atomicAdd usage
+  globalContext().alertNotDeterministic("_histc_cuda");
   return AT_DISPATCH_ALL_TYPES(self.scalar_type(), "histc", [&] {
     return _histc_cuda_template<scalar_t>(self, nbins, min.to<scalar_t>(), max.to<scalar_t>());
   });

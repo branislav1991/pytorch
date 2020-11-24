@@ -1,18 +1,23 @@
 import os
 import sys
-import unittest
-from typing import List, Dict
+import inspect
+from typing import Dict, List, Optional, Tuple, Any
 from textwrap import dedent
 from collections import OrderedDict
 
 import torch
 from torch.testing import FileCheck
-from torch._six import PY2
+from torch import Tensor
 
 # Make the helper files in test/ importable
 pytorch_test_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 sys.path.append(pytorch_test_dir)
-from jit_utils import JitTestCase
+from torch.testing._internal.jit_utils import JitTestCase
+
+if __name__ == '__main__':
+    raise RuntimeError("This test file is not meant to be run directly, use:\n\n"
+                       "\tpython test/test_jit.py TESTNAME\n\n"
+                       "instead.")
 
 class TestList(JitTestCase):
     def test_in_check(self):
@@ -41,21 +46,21 @@ class TestList(JitTestCase):
     def test_list_literal(self):
         def reassign():
             x = [1]
-            if True:
+            if 1 == 1:
                 x = [2, 3]
             return
         self.checkScript(reassign, (), optimize=False)
 
         def reassign_arity_change():
             x = [1]
-            if True:
+            if 1 == 1:
                 x = [1, 2, 3]
             return
         self.checkScript(reassign_arity_change, (), optimize=False)
 
         def reassign_from_empty_literal():
             x = []
-            if True:
+            if 1 == 1:
                 x = [1, 2, 3]
             return
         with self.assertRaisesRegex(RuntimeError, r"previously has type List\[Tensor\]"):
@@ -63,20 +68,20 @@ class TestList(JitTestCase):
 
         def reassign_from_empty_builtin():
             x = torch.jit.annotate(List[int], [])
-            if True:
+            if 1 == 1:
                 x = [1, 2, 3]
             y = torch.jit.annotate(List[float], [])
-            if True:
+            if 1 == 1:
                 y = [1.0, 2.0, 3.0]
             z = []
-            if True:
+            if 1 == 1:
                 z = [torch.randn([1])]
             return
         self.checkScript(reassign_from_empty_builtin, (), optimize=False)
 
         def reassign_bad_type():
             x = [1]
-            if True:
+            if 1 == 1:
                 x = [1.0]
             return
         with self.assertRaisesRegex(RuntimeError, "previously has type"):
@@ -84,13 +89,65 @@ class TestList(JitTestCase):
 
         def reassign_nested():
             x = torch.jit.annotate(List[int], [])
-            if True:
+            if 1 == 1:
                 x = [1, 2, 3]
-                if True:
+                if 1 == 1:
                     x = [1.0]
             return
         with self.assertRaisesRegex(RuntimeError, "previously has type"):
             self.checkScript(reassign_nested, (), optimize=False)
+
+    def test_del(self):
+        def inputs():
+            return [1, 2, 3, 4]
+
+        def fn(x):
+            # type: (List[int]) -> List[int]
+            del x[1]
+            return x
+
+        python_out = fn(inputs())
+        # checkScript reuses the same object, but here it's being mutated so do
+        # it manually
+        cu = torch.jit.CompilationUnit()
+        cu.define(dedent(inspect.getsource(fn)))
+        self.assertEqual(cu.fn(inputs()), python_out)
+        self.assertEqual(torch.jit.script(fn)(inputs()), python_out)
+
+        @torch.jit.script
+        def fn2(x):
+            # type: (List[int]) -> List[int]
+            del x[100]
+            return x
+
+        with self.assertRaisesRegex(RuntimeError, "out of range"):
+            fn2([])
+
+        with self.assertRaisesRegex(RuntimeError, "deletion at a single index"):
+            @torch.jit.script
+            def fn(x):
+                # type: (List[int]) -> List[int]
+                del x[1:3]
+                return x
+
+    def test_list_keyword(self):
+        def foo():
+            return list([1, 2, 3]), list(("a", "b")), list(range(5)), list("abcdefg")  # noqa: C410
+
+        self.checkScript(foo, ())
+
+        def foo2():
+            x: List[int] = list()
+            x.append(1)
+            return x,
+
+        self.checkScript(foo2, ())
+
+        def foo3():
+            return list(list("abc"))
+
+        self.checkScript(foo3, ())
+        FileCheck().check_count("aten::list", 2, exactly=True).run(torch.jit.script(foo3).graph)
 
     def test_min_bool_list(self):
         def jit_min_list(a, b):
@@ -200,12 +257,26 @@ class TestList(JitTestCase):
 
         self.checkScript(test_equality, (), optimize=True)
 
+        def test_equality_str():
+            a = ["foo", "bar"]
+            b = ["foo", "bar"]
+            return a == b
+
+        self.checkScript(test_equality_str, (), optimize=True)
+
         def test_inequality():
             a = [1, 2, 3]
             b = [1, 2, 3]
             return a != b
 
-        self.checkScript(test_equality, (), optimize=True)
+        self.checkScript(test_inequality, (), optimize=True)
+
+        def test_inequality_str():
+            a = ["foo", "bar"]
+            b = ["foo", "bar", "food"]
+            return a != b
+
+        self.checkScript(test_inequality_str, (), optimize=True)
 
         def test_non_equality():
             a = [1, 2, 3]
@@ -269,7 +340,7 @@ class TestList(JitTestCase):
             test_invalid_list_equality,
             (),
             RuntimeError,
-            "bool value of Tensor")
+            "Boolean value of Tensor")
 
     def test_list_sort(self):
         template = dedent('''
@@ -301,7 +372,7 @@ class TestList(JitTestCase):
             return x
 
         self.checkScriptRaisesRegex(test_fail, (([torch.zeros([2]), torch.zeros([2])],)), Exception,
-                                    "bool value of Tensor with more than one value")
+                                    "Boolean value of Tensor with more than one value")
 
         @torch.jit.script
         def test_mutation():
@@ -311,6 +382,14 @@ class TestList(JitTestCase):
 
         test_mutation()
         FileCheck().check("aten::sort").run(test_mutation.graph_for())
+
+        def test_sorted_copy():
+            a = [torch.tensor(2), torch.tensor(0), torch.tensor(1)]
+            b = sorted(a)
+            a[0] = torch.tensor(10)
+            return a, b
+
+        self.checkScript(test_sorted_copy, ())
 
     def test_list_slice(self):
         def test_regular_slice():
@@ -347,6 +426,43 @@ class TestList(JitTestCase):
             a = [0, 1, 2, 3, 4]
             return a[3:10] == [3, 4]
         self.checkScript(test_backward_slice, ())
+
+    def test_slice_index(self):
+        a = torch.tensor(
+            [
+                [[1, 11], [2, 22]],
+                [[3, 33], [4, 44]],
+                [[5, 55], [6, 66]],
+            ]
+        )
+
+        def test_index_slice1(x):
+            x = x[:, :, [0, 1]]
+            return x
+        self.checkScript(test_index_slice1, (a,))
+
+        def test_index_slice2(x):
+            x = x[[2, 1, 0], :, :]
+            return x
+        self.checkScript(test_index_slice2, (a,))
+
+        def test_index_slice3(x):
+            x = x[[0, 1], :, [1]]
+            return x
+        self.checkScript(test_index_slice3, (a,))
+
+        def test_index_slice_empty_list(x):
+            empty_list: List[int] = []
+            x = x[empty_list, :, :]
+            return x
+        self.checkScript(test_index_slice_empty_list, (a,))
+
+        def test_index_slice_out_of_bounds_index(x):
+            x = x[[4], :, :]
+            return x
+        with self.assertRaisesRegex(RuntimeError, "index 4 is out of bounds for dimension 0 with size 3"):
+            self.checkScript(test_index_slice_out_of_bounds_index, (a,))
+
 
     def test_mutable_list_append(self):
         def test_append():
@@ -399,15 +515,15 @@ class TestList(JitTestCase):
             self.assertEqual(fn(*inputs), torch.jit.script(fn)(*inputs))
 
         def foo(names, results):
-            # type: (List[int], List[int])
+            # type: (List[int], List[int]) -> List[Tuple[int, int]]
             return [(k + 5, v - 2) for k, v in zip(names, results)]
 
         test_func(foo, ([1, 2, 4], [4, 7, 9]))
         test_func(foo, ([5], [4, 7, 9]))
 
         def fn(x):
-            # type: (int)
-            return [i for i in range(x)]
+            # type: (int) -> List[int]
+            return [i for i in range(x)]  # noqa: C416
 
         test_func(fn, (9,))
         test_func(fn, (0,))
@@ -438,7 +554,7 @@ class TestList(JitTestCase):
     def test_mutable_list_append_if(self):
         def test_append_if():
             a = [1]
-            if True:
+            if 1 == 1:
                 a.append(4)
             return a == [1, 4]
         self.checkScript(test_append_if, ())
@@ -446,7 +562,7 @@ class TestList(JitTestCase):
     def test_mutable_list_append_if_else(self):
         def test_append_if_else():
             a = [1]
-            if False:
+            if 1 == 2:
                 a.append(4)
             else:
                 a.append(10)
@@ -597,7 +713,6 @@ class TestList(JitTestCase):
 
         self.checkScript(test_pop_slice, ())
 
-    @unittest.skipIf(sys.version_info < (3, 3), "clear not supported in version < 3.3")
     def test_mutable_list_clear_empty(self):
         def test_clear_empty():
             a = torch.jit.annotate(List[int], [])
@@ -606,7 +721,6 @@ class TestList(JitTestCase):
             return len(a) == 0
         self.checkScript(test_clear_empty, ())
 
-    @unittest.skipIf(sys.version_info < (3, 3), "clear not supported in version < 3.3")
     def test_mutable_list_clear(self):
         def test_clear():
             a = [1, 2, 3, 4]
@@ -666,6 +780,13 @@ class TestList(JitTestCase):
             return a == [1, 2, 4]
         self.checkScript(test_list_remove, ())
 
+        def test_str_list_remove():
+            a = ["foo", "bar"]
+            a.remove("foo")
+
+            return a == ["bar"]
+        self.checkScript(test_str_list_remove, ())
+
     def test_list_index_not_existing(self):
         @torch.jit.script
         def list_index_not_existing():
@@ -684,6 +805,13 @@ class TestList(JitTestCase):
 
             return i == 2
         self.checkScript(list_index, ())
+
+        def list_str_index():
+            a = ["foo", "bar"]
+            i = a.index("bar")
+
+            return i == 1
+        self.checkScript(list_str_index, ())
 
     def test_tensor_list_index(self):
         def tensor_list_index():
@@ -711,6 +839,13 @@ class TestList(JitTestCase):
 
             return i == 3
         self.checkScript(list_count, ())
+
+        def list_str_count():
+            a = ["foo", "bar", "foo"]
+            i = a.count("foo")
+
+            return i == 2
+        self.checkScript(list_str_count, ())
 
     def test_list_count_not_existing(self):
         def list_count_not_existing():
@@ -832,13 +967,255 @@ class TestList(JitTestCase):
             check_list(min_intlist, int_list)
             check_list(max_intlist, int_list)
 
-            bool_li = list(map(lambda x: bool(x), int_list))
+            bool_li = [bool(x) for x in int_list]
             check_list(min_boollist, bool_li)
             check_list(max_boollist, bool_li)
 
-            float_li = list(map(lambda x: float(x), int_list))
+            float_li = [float(x) for x in int_list]
             check_list(min_floatlist, float_li)
             check_list(max_floatlist, float_li)
+
+    def test_to_list(self):
+        """Unit tests for Tensor.tolist() function."""
+
+        """
+        Boolean dtype unit tests.
+        """
+        def to_list_bool_0D(x):
+            # type: (torch.Tensor) -> bool
+            li = torch.jit.annotate(bool, x.tolist())
+            return li
+
+        def to_list_bool_1D(x):
+            # type: (torch.Tensor) -> List[bool]
+            li = torch.jit.annotate(List[bool], x.tolist())
+            return li
+
+        def to_list_bool_2D(x):
+            # type: (torch.Tensor) -> List[List[bool]]
+            li = torch.jit.annotate(List[List[bool]], x.tolist())
+            return li
+
+        def to_list_bool_3D(x):
+            # type: (torch.Tensor) -> List[List[List[bool]]]
+            li = torch.jit.annotate(List[List[List[bool]]], x.tolist())
+            return li
+
+        self.checkScript(to_list_bool_0D, (torch.tensor(False, dtype=torch.bool),))
+        bool_input_1D = torch.tensor([True, False, True, False], dtype=torch.bool)
+        self.checkScript(to_list_bool_1D, (bool_input_1D,))
+        bool_input_2D = torch.tensor(
+            [[True, True, False], [False, True, False]], dtype=torch.bool
+        )
+        self.checkScript(to_list_bool_2D, (bool_input_2D,))
+        bool_input_3D = torch.tensor(
+            [[[True, False], [False, True]], [[True, False], [False, False]]],
+            dtype=torch.bool,
+        )
+        self.checkScript(to_list_bool_3D, (bool_input_3D,))
+        bool_input_noncontiguous = torch.tensor(
+            [[[True, False], [False, True]], [[True, False], [False, False]]],
+            dtype=torch.bool,
+        ).transpose(0, 1)
+        self.checkScript(to_list_bool_3D, (bool_input_noncontiguous,))
+
+        """
+        Int dtype unit tests.
+        """
+        def to_list_int_0D(x):
+            # type: (torch.Tensor) -> int
+            li = torch.jit.annotate(int, x.tolist())
+            return li
+
+        def to_list_int_1D(x):
+            # type: (torch.Tensor) -> List[int]
+            li = torch.jit.annotate(List[int], x.tolist())
+            return li
+
+        def to_list_int_2D(x):
+            # type: (torch.Tensor) -> List[List[int]]
+            li = torch.jit.annotate(List[List[int]], x.tolist())
+            return li
+
+        def to_list_int_3D(x):
+            # type: (torch.Tensor) -> List[List[List[int]]]
+            li = torch.jit.annotate(List[List[List[int]]], x.tolist())
+            return li
+
+        self.checkScript(to_list_int_0D, (torch.tensor(1, dtype=torch.long),))
+        int_input_1D = torch.tensor([1, 2, 3, 4], dtype=torch.long)
+        self.checkScript(to_list_int_1D, (int_input_1D,))
+        int_input_2D = torch.tensor([[1, 2, 3], [3, 4, 5]], dtype=torch.long)
+        self.checkScript(to_list_int_2D, (int_input_2D,))
+        int_input_3D = torch.tensor(
+            [[[1, 2], [3, 4]], [[5, 6], [7, 8]]], dtype=torch.long
+        )
+        self.checkScript(to_list_int_3D, (int_input_3D,))
+        int_input_noncontiguous = torch.tensor(
+            [[[1, 2], [3, 4]], [[5, 6], [7, 8]]], dtype=torch.long
+        ).transpose(0, 1)
+        self.checkScript(to_list_int_3D, (int_input_noncontiguous,))
+
+        """
+        Float dtype unit tests.
+        """
+        def to_list_float_0D(x):
+            # type: (torch.Tensor) -> float
+            li = torch.jit.annotate(float, x.tolist())
+            return li
+
+        def to_list_float_1D(x):
+            # type: (torch.Tensor) -> List[float]
+            li = torch.jit.annotate(List[float], x.tolist())
+            return li
+
+        def to_list_float_2D(x):
+            # type: (torch.Tensor) -> List[List[float]]
+            li = torch.jit.annotate(List[List[float]], x.tolist())
+            return li
+
+        def to_list_float_3D(x):
+            # type: (torch.Tensor) -> List[List[List[float]]]
+            li = torch.jit.annotate(List[List[List[float]]], x.tolist())
+            return li
+
+        # Test with torch.float dtype Tensors to check that they are converted to double automatically.
+        self.checkScript(to_list_float_0D, (torch.randn(5, dtype=torch.float)[0],))
+        self.checkScript(to_list_float_1D, (torch.randn(5, dtype=torch.float),))
+        self.checkScript(to_list_float_2D, (torch.randn(5, 6, dtype=torch.float),))
+        self.checkScript(to_list_float_3D, (torch.randn(5, 6, 7, dtype=torch.float),))
+        self.checkScript(to_list_float_3D, (torch.randn(5, 6, 7, dtype=torch.float).transpose(0, 1),))
+
+        self.checkScript(to_list_float_0D, (torch.randn(5, dtype=torch.double)[0],))
+        self.checkScript(to_list_float_1D, (torch.randn(5, dtype=torch.double),))
+        self.checkScript(to_list_float_2D, (torch.randn(5, 6, dtype=torch.double),))
+        self.checkScript(to_list_float_3D, (torch.randn(5, 6, 7, dtype=torch.double),))
+        self.checkScript(to_list_float_3D, (torch.randn(5, 6, 7, dtype=torch.double).transpose(0, 1),))
+
+        """
+        Non-happy path tests:
+            - missing type annotation
+            - mismatch between type annotation and input
+            - type annotation with unsupported type
+            - type annotation with the wrong dimension
+            - type annotation with scalar type that doesn't match the input scalar type
+        """
+        def to_list_missing_type_annotation(x):
+            # type: (torch.Tensor) -> List[float]
+            li = x.tolist()
+            return li
+
+        def to_list_incorrect_type_annotation(x):
+            # type: (torch.Tensor) -> List[float]
+            li = torch.jit.annotate(float, x.tolist())
+            return li
+
+        def to_list_unsupported_type_annotation(x):
+            # type: (torch.Tensor) -> List[float]
+            li = torch.jit.annotate(List[str], x.tolist())
+            return li
+
+        def to_list_type_annotation_wrong_dim(x):
+            # type: (torch.Tensor) -> List[List[float]]
+            li = torch.jit.annotate(List[List[float]], x.tolist())
+            return li
+
+        def to_list_type_annotation_incorrect_scalar_type(x):
+            # type: (torch.Tensor) -> List[float]
+            li = torch.jit.annotate(List[float], x.tolist())
+            return li
+
+        with self.assertRaisesRegexWithHighlight(
+            RuntimeError,
+            r"Expected type hint for result of tolist()",
+            "x.tolist("
+        ):
+            self.checkScript(to_list_missing_type_annotation, (torch.randn(5),))
+
+        with self.assertRaisesRegexWithHighlight(
+            RuntimeError,
+            r"Return value was annotated as having type List\[float\] but is actually of type float",
+            "return li"
+        ):
+            self.checkScript(to_list_incorrect_type_annotation, (torch.randn(5),))
+
+        with self.assertRaisesRegex(
+            RuntimeError, r"str is not one of the supported element types for tolist"
+        ):
+            self.checkScript(to_list_unsupported_type_annotation, (torch.randn(5),))
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"Output annotation list dimension and runtime tensor dimension must match",
+        ):
+            self.checkScript(to_list_type_annotation_wrong_dim, (torch.randn(5, dtype=torch.double),))
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"Output annotation element type and runtime tensor element type must match",
+        ):
+            self.checkScript(
+                to_list_type_annotation_incorrect_scalar_type,
+                (torch.ones(5, dtype=torch.long),),
+            )
+
+
+    def test_to_list_gpu(self):
+        """GPU tests for Tensor.tolist() function."""
+        if not torch.cuda.is_available() or torch.cuda.device_count() == 0:
+            self.skipTest("CUDA is not available")
+
+        def to_list_bool_1D(x):
+            # type: (torch.Tensor) -> List[bool]
+            li = torch.jit.annotate(List[bool], x.tolist())
+            return li
+
+        def to_list_int_1D(x):
+            # type: (torch.Tensor) -> List[int]
+            li = torch.jit.annotate(List[int], x.tolist())
+            return li
+
+        def to_list_float_1D(x):
+            # type: (torch.Tensor) -> List[float]
+            li = torch.jit.annotate(List[float], x.tolist())
+            return li
+
+        self.checkScript(to_list_bool_1D, (torch.tensor(
+            [True, False, True, False], dtype=torch.bool).cuda(),))
+        self.checkScript(to_list_int_1D, (torch.tensor(
+            [1, 2, 3, 4], dtype=torch.long).cuda(),))
+        self.checkScript(to_list_float_1D, (torch.randn(
+            5, dtype=torch.double).cuda(),))
+
+    def test_no_element_type_annotation(self):
+        def fn_with_comment(x):
+            # type: (torch.Tensor) -> List
+            a: List = x.tolist()
+            return a
+
+        def annotated_fn(x: torch.Tensor) -> List:
+            a: List = x.tolist()
+            return a
+
+        with self.assertRaisesRegex(RuntimeError, r"Attempted to use List without a contained type"):
+            cu = torch.jit.CompilationUnit()
+            cu.define(dedent(inspect.getsource(fn_with_comment)))
+
+        with self.assertRaisesRegex(RuntimeError, r"Attempted to use List without a contained type"):
+            cu = torch.jit.CompilationUnit()
+            cu.define(dedent(inspect.getsource(annotated_fn)))
+
+        with self.assertRaisesRegex(RuntimeError, r"Attempted to use List without a contained type"):
+            torch.jit.script(fn_with_comment)
+
+        with self.assertRaisesRegex(RuntimeError, r"Attempted to use List without a contained type"):
+            torch.jit.script(annotated_fn)
+
+    def test_list_none(self):
+        with self.assertRaisesRegex(RuntimeError, "Can not create ListType with None type"):
+            x = torch._C.ListType(None)
+
+
 
 class TestDict(JitTestCase):
     def dict(self):
@@ -846,6 +1223,28 @@ class TestDict(JitTestCase):
 
     def dict2(self):
         return {'x': torch.ones(1) + 100, 'y': torch.ones(1) + 101, 'z': torch.ones(1) + 102}
+
+    def dict_bool(self):
+        return {True: 1}
+
+    def test_del(self):
+        def inputs():
+            return {'hi': 2, 'bye': 3}
+
+        def fn(x):
+            # type: (Dict[str, int]) -> Dict[str, int]
+            del x['hi']
+            return x
+
+        python_out = fn(inputs())
+        # checkScript reuses the same object, but here it's being mutated so do
+        # it manually
+        cu = torch.jit.CompilationUnit()
+        cu.define(dedent(inspect.getsource(fn)))
+        self.assertEqual(cu.fn(inputs()), python_out)
+        self.assertEqual(torch.jit.script(fn)(inputs()), python_out)
+        with self.assertRaisesRegex(RuntimeError, "KeyError"):
+            self.checkScript(fn, [{}])
 
     def test_keys(self):
         @torch.jit.script
@@ -945,6 +1344,15 @@ class TestDict(JitTestCase):
         self.checkScript(update, (self.dict(), self.dict()))
         self.checkScript(update, (self.dict(), self.dict2()))
 
+    def test_update_existing_key(self):
+        def foo() -> Dict[str, int]:
+            a: Dict[str, int] = {}
+            for i in range(3):
+                a.update({'a': i})
+            return a
+
+        self.checkScript(foo, ())
+
     def test_aug_assign(self):
         def aug_assign_dict_tensor(a):
             # type: (Dict[str, Tensor]) -> Dict[str, Tensor]
@@ -952,6 +1360,7 @@ class TestDict(JitTestCase):
             a['b'] -= 12
             a['c'] *= 122
             a['c'] /= 2
+            a['c'] %= 2
             return a
 
         def aug_assign_dict_prim(a):
@@ -960,6 +1369,7 @@ class TestDict(JitTestCase):
             a['b'] -= 2.4
             a['c'] *= 3.0
             a['c'] /= 2.0
+            a['c'] %= 2.0
             return a
 
         self.checkScript(aug_assign_dict_tensor, (self.dict(),))
@@ -982,10 +1392,7 @@ class TestDict(JitTestCase):
         self.assertEqual(len(eager_out[1]), len(script_out[1]))
 
         # Check that the item is the correct types
-        if PY2:
-            self.assertTrue(isinstance(script_out[0][0], unicode))
-        else:
-            self.assertTrue(isinstance(script_out[0][0], str))
+        self.assertTrue(isinstance(script_out[0][0], str))
         self.assertTrue(isinstance(script_out[0][1], torch.Tensor))
 
     def test_clear(self):
@@ -1010,6 +1417,21 @@ class TestDict(JitTestCase):
 
         self.checkScript(get, (self.dict(), 'a'))
         self.checkScript(get, (self.dict(), "doesn't exist"))
+
+    def test_get_boolkey(self):
+        def get(x, key):
+            # type: (Dict[bool, int], bool) -> Optional[int]
+            return x.get(key)
+
+        self.checkScript(get, (self.dict_bool(), True))
+        self.checkScript(get, (self.dict_bool(), False))
+
+        def get_default(x, key):
+            # type: (Dict[bool, int], bool) -> int
+            return x.get(key, 42)
+
+        self.checkScript(get_default, (self.dict_bool(), True))
+        self.checkScript(get_default, (self.dict_bool(), False))
 
     def test_basic(self):
         def simple(x):
@@ -1071,7 +1493,7 @@ class TestDict(JitTestCase):
         self.assertEqual(fn(), {'ok': 10})
 
     def test_key_type(self):
-        with self.assertRaisesRegex(RuntimeError, "Expected key type 'None' to subtype"):
+        with self.assertRaisesRegex(RuntimeError, "but instead found type"):
             @torch.jit.script
             def fn(a):
                 # type: (Dict[str, int]) -> int
@@ -1157,6 +1579,15 @@ class TestDict(JitTestCase):
 
         test_func(test_dict_constructor, ())
 
+        def test_dict_initializer_list():
+            a = {"1": torch.tensor(1), "2": torch.tensor(2)}
+            output_order = []
+            for key in a:
+                output_order.append(a[key])
+            return output_order
+
+        test_func(test_dict_initializer_list, ())
+
         def test_dict_error():
             a = dict()
             a[1] = 2
@@ -1165,8 +1596,30 @@ class TestDict(JitTestCase):
         with self.assertRaisesRegex(Exception, "Arguments for call are not"):
             torch.jit.script(test_dict_error)
 
+    def test_type_annotation_missing_contained_type(self):
+        """
+        Test that the use of a Dict type annotation without contained
+        key and value types produces an error.
+        """
+        # This function uses a type comment.
+        def fn_with_comment(input):
+            # type: (Dict) -> Any
+            return input
 
-if __name__ == '__main__':
-    raise RuntimeError("This test file is not meant to be run directly, use:\n\n"
-                       "\tpython test/test_jit.py TESTNAME\n\n"
-                       "instead.")
+        # This function uses Python3 style type annotations.
+        def annotated_fn(input: Dict) -> Any:
+            return input
+
+        with self.assertRaisesRegex(RuntimeError, r"Attempted to use Dict without contained types"):
+            cu = torch.jit.CompilationUnit()
+            cu.define(dedent(inspect.getsource(fn_with_comment)))
+
+        with self.assertRaisesRegex(RuntimeError, r"Attempted to use Dict without contained types"):
+            cu = torch.jit.CompilationUnit()
+            cu.define(dedent(inspect.getsource(annotated_fn)))
+
+        with self.assertRaisesRegex(RuntimeError, r"Attempted to use Dict without contained types"):
+            m = torch.jit.script(fn_with_comment)
+
+        with self.assertRaisesRegex(RuntimeError, r"Attempted to use Dict without contained types"):
+            m = torch.jit.script(annotated_fn)

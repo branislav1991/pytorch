@@ -50,7 +50,9 @@ struct dists {
 
   // Special case backward when p is less than two
   struct lt_two {
-    static __forceinline__ __device__ scalar_t backward(const scalar_t diff, const scalar_t grad, const scalar_t dist, const scalar_t p) { return dist == 0.0 ? 0 : sign(diff) * std::pow(std::abs(diff), p - 1) * grad / std::pow(dist, p - 1); }
+    static __forceinline__ __device__ scalar_t backward(const scalar_t diff, const scalar_t grad, const scalar_t dist, const scalar_t p) {
+      return (dist == 0.0 || (diff == 0.0 && p < 1)) ? 0 : (sign(diff) * std::pow(std::abs(diff), p - 1) * grad / std::pow(dist, p - 1));
+    }
   };
 
   // Two norm
@@ -105,7 +107,7 @@ __device__ static inline scalar_t reduce_agg(scalar_t agg) {
 template <typename scalar_t, typename F>
 __global__ static void pdist_kernel_cuda_impl(scalar_t * result, const scalar_t * self, const int64_t n, const int64_t m, const scalar_t p,
                                               const double n2, const double n2_squared_minus_1) {
-  const int k = blockIdx.x;
+  const int64_t k = blockIdx.x;
   const int stride = blockDim.x;
 
   // The -1 accounts for floating point truncation issues
@@ -162,9 +164,9 @@ __global__ static void cdist_backward_kernel_cuda_impl(scalar_t * buffer, const 
 template <typename scalar_t, typename F>
 __global__ static void pdist_backward_kernel_cuda_impl(scalar_t * buffer, const scalar_t * grad, const scalar_t * self, const scalar_t * dist, int64_t gs, const int64_t n, const int64_t m, const int64_t combs, const scalar_t p,
                                                        const double n2, const double n2_squared_minus_1) {
-  const int k = blockIdx.y * blockDim.y + threadIdx.y;
-  const int init = blockIdx.x * blockDim.x + threadIdx.x;
-  const int stride = blockDim.x * gridDim.x;
+  const int64_t k = blockIdx.x * blockDim.x + threadIdx.x;
+  const int init = blockIdx.y * blockDim.y + threadIdx.y;
+  const int stride = blockDim.y * gridDim.y;
 
   if (k >= combs) {
     return;
@@ -229,17 +231,21 @@ void cdist_kernel_impl(Tensor& result, const Tensor& x1, const Tensor& x2, doubl
   AT_DISPATCH_FLOATING_TYPES(x1.scalar_type(), "cdist_cuda", [&] {
     if (p == 0.0) {
       cdist_kernel_cuda_impl<scalar_t, dists<scalar_t>::zero><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(result.data_ptr<scalar_t>(), x1.data_ptr<scalar_t>(), x2.data_ptr<scalar_t>(), p, r1, r2, m, r_size, l1_size, l2_size);
+      TORCH_CUDA_KERNEL_LAUNCH_CHECK();
     } else if (p == 1.0) {
       cdist_kernel_cuda_impl<scalar_t, dists<scalar_t>::one><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(result.data_ptr<scalar_t>(), x1.data_ptr<scalar_t>(), x2.data_ptr<scalar_t>(), p, r1, r2, m, r_size, l1_size, l2_size);
+      TORCH_CUDA_KERNEL_LAUNCH_CHECK();
     } else if (p == 2.0) {
       cdist_kernel_cuda_impl<scalar_t, dists<scalar_t>::two><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(result.data_ptr<scalar_t>(), x1.data_ptr<scalar_t>(), x2.data_ptr<scalar_t>(), p, r1, r2, m, r_size, l1_size, l2_size);
+      TORCH_CUDA_KERNEL_LAUNCH_CHECK();
     } else if (std::isinf(p)) {
       cdist_kernel_cuda_impl<scalar_t, dists<scalar_t>::inf><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(result.data_ptr<scalar_t>(), x1.data_ptr<scalar_t>(), x2.data_ptr<scalar_t>(), p, r1, r2, m, r_size, l1_size, l2_size);
+      TORCH_CUDA_KERNEL_LAUNCH_CHECK();
     } else {
       cdist_kernel_cuda_impl<scalar_t, dists<scalar_t>::p><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(result.data_ptr<scalar_t>(), x1.data_ptr<scalar_t>(), x2.data_ptr<scalar_t>(), p, r1, r2, m, r_size, l1_size, l2_size);
+      TORCH_CUDA_KERNEL_LAUNCH_CHECK();
     }
   });
-  AT_CUDA_CHECK(cudaGetLastError());
 }
 
 void pdist_forward_kernel_impl(Tensor& result, const Tensor& self, double p) {
@@ -255,17 +261,21 @@ void pdist_forward_kernel_impl(Tensor& result, const Tensor& self, double p) {
   AT_DISPATCH_FLOATING_TYPES(self.scalar_type(), "pdist_cuda", [&] {
     if (p == 0.0) {
       pdist_kernel_cuda_impl<scalar_t, dists<scalar_t>::zero><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(result.data_ptr<scalar_t>(), self.data_ptr<scalar_t>(), n, m, p, n2, n2_squared_minus_1);
+      TORCH_CUDA_KERNEL_LAUNCH_CHECK();
     } else if (p == 1.0) {
       pdist_kernel_cuda_impl<scalar_t, dists<scalar_t>::one><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(result.data_ptr<scalar_t>(), self.data_ptr<scalar_t>(), n, m, p, n2, n2_squared_minus_1);
+      TORCH_CUDA_KERNEL_LAUNCH_CHECK();
     } else if (p == 2.0) {
       pdist_kernel_cuda_impl<scalar_t, dists<scalar_t>::two><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(result.data_ptr<scalar_t>(), self.data_ptr<scalar_t>(), n, m, p, n2, n2_squared_minus_1);
+      TORCH_CUDA_KERNEL_LAUNCH_CHECK();
     } else if (std::isinf(p)) {
       pdist_kernel_cuda_impl<scalar_t, dists<scalar_t>::inf><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(result.data_ptr<scalar_t>(), self.data_ptr<scalar_t>(), n, m, p, n2, n2_squared_minus_1);
+      TORCH_CUDA_KERNEL_LAUNCH_CHECK();
     } else {
       pdist_kernel_cuda_impl<scalar_t, dists<scalar_t>::p><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(result.data_ptr<scalar_t>(), self.data_ptr<scalar_t>(), n, m, p, n2, n2_squared_minus_1);
+      TORCH_CUDA_KERNEL_LAUNCH_CHECK();
     }
   });
-  AT_CUDA_CHECK(cudaGetLastError());
 }
 
 void pdist_backward_kernel_impl(Tensor& result, const Tensor& grad, const Tensor& self, const double p, const Tensor& dist) {
@@ -276,13 +286,12 @@ void pdist_backward_kernel_impl(Tensor& result, const Tensor& grad, const Tensor
 
   const int64_t n = result.size(0);
   int64_t m = self.size(1);
-  const int block_x = 64;
+  const int block_x = 16;
   // NB: be careful with changing block_y; as it's currently written, grid_y is limited to be 2^16.
-  // From binary search, block_y of 16 gives us max pdist dim0 of 1449,
-  //                     block_y of  4 gives us max pdist dim0 of  725.
-  const int block_y = 16;
-  const int grid_x = (m + block_x * 8 - 1) / (block_x * 8);
-  const int grid_y = (dist.numel() + block_y - 1) / block_y;
+  // block_y of 64 gives us max pdist dim1 of 2**24
+  const int block_y = 64;
+  const int grid_x = (dist.numel() + block_x - 1) / block_x;
+  const int grid_y = (m + block_y * 8 - 1) / (block_y * 8);
   const dim3 grid(grid_x, grid_y);
   const dim3 block(block_x, block_y);
   // https://github.com/pytorch/pytorch/issues/15511 demonstrated we need to do
@@ -294,17 +303,21 @@ void pdist_backward_kernel_impl(Tensor& result, const Tensor& grad, const Tensor
   AT_DISPATCH_FLOATING_TYPES(self.scalar_type(), "pdist_cuda_backward", [&] {
     if (p == 1.0) {
       pdist_backward_kernel_cuda_impl<scalar_t, dists<scalar_t>::one><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(buffer.data_ptr<scalar_t>(), grad.data_ptr<scalar_t>(), self.data_ptr<scalar_t>(), dist.data_ptr<scalar_t>(), grad.stride(0), n, m, dist.numel(), p, n2, n2_squared_minus_1);
+      TORCH_CUDA_KERNEL_LAUNCH_CHECK();
     } else if (p < 2.0) {
       pdist_backward_kernel_cuda_impl<scalar_t, dists<scalar_t>::lt_two><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(buffer.data_ptr<scalar_t>(), grad.data_ptr<scalar_t>(), self.data_ptr<scalar_t>(), dist.data_ptr<scalar_t>(), grad.stride(0), n, m, dist.numel(), p, n2, n2_squared_minus_1);
+      TORCH_CUDA_KERNEL_LAUNCH_CHECK();
     } else if (p == 2.0) {
       pdist_backward_kernel_cuda_impl<scalar_t, dists<scalar_t>::two><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(buffer.data_ptr<scalar_t>(), grad.data_ptr<scalar_t>(), self.data_ptr<scalar_t>(), dist.data_ptr<scalar_t>(), grad.stride(0), n, m, dist.numel(), p, n2, n2_squared_minus_1);
+      TORCH_CUDA_KERNEL_LAUNCH_CHECK();
     } else if (std::isinf(p)) {
       pdist_backward_kernel_cuda_impl<scalar_t, dists<scalar_t>::inf><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(buffer.data_ptr<scalar_t>(), grad.data_ptr<scalar_t>(), self.data_ptr<scalar_t>(), dist.data_ptr<scalar_t>(), grad.stride(0), n, m, dist.numel(), p, n2, n2_squared_minus_1);
+      TORCH_CUDA_KERNEL_LAUNCH_CHECK();
     } else {
       pdist_backward_kernel_cuda_impl<scalar_t, dists<scalar_t>::p><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(buffer.data_ptr<scalar_t>(), grad.data_ptr<scalar_t>(), self.data_ptr<scalar_t>(), dist.data_ptr<scalar_t>(), grad.stride(0), n, m, dist.numel(), p, n2, n2_squared_minus_1);
+      TORCH_CUDA_KERNEL_LAUNCH_CHECK();
     }
   });
-  AT_CUDA_CHECK(cudaGetLastError());
 
   at::sum_out(result, buffer, 0);
 }
@@ -341,25 +354,29 @@ void cdist_backward_kernel_impl(Tensor& result, const Tensor& grad, const Tensor
       cdist_backward_kernel_cuda_impl<scalar_t, dists<scalar_t>::one><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(buffer.data_ptr<scalar_t>(),
       grad.data_ptr<scalar_t>(), x1.data_ptr<scalar_t>(), x2.data_ptr<scalar_t>(), dist.data_ptr<scalar_t>(),
       gs, p, r1, r2, m, count, r_size, l1_size, l2_size);
+      TORCH_CUDA_KERNEL_LAUNCH_CHECK();
     } else if (p < 2.0) {
       cdist_backward_kernel_cuda_impl<scalar_t, dists<scalar_t>::lt_two><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(buffer.data_ptr<scalar_t>(),
       grad.data_ptr<scalar_t>(), x1.data_ptr<scalar_t>(), x2.data_ptr<scalar_t>(), dist.data_ptr<scalar_t>(),
       gs, p, r1, r2, m, count, r_size, l1_size, l2_size);
+      TORCH_CUDA_KERNEL_LAUNCH_CHECK();
     } else if (p == 2.0) {
       cdist_backward_kernel_cuda_impl<scalar_t, dists<scalar_t>::two><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(buffer.data_ptr<scalar_t>(),
       grad.data_ptr<scalar_t>(), x1.data_ptr<scalar_t>(), x2.data_ptr<scalar_t>(), dist.data_ptr<scalar_t>(),
       gs, p, r1, r2, m, count, r_size, l1_size, l2_size);
+      TORCH_CUDA_KERNEL_LAUNCH_CHECK();
     } else if (std::isinf(p)) {
       cdist_backward_kernel_cuda_impl<scalar_t, dists<scalar_t>::inf><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(buffer.data_ptr<scalar_t>(),
       grad.data_ptr<scalar_t>(), x1.data_ptr<scalar_t>(), x2.data_ptr<scalar_t>(), dist.data_ptr<scalar_t>(),
       gs, p, r1, r2, m, count, r_size, l1_size, l2_size);
+      TORCH_CUDA_KERNEL_LAUNCH_CHECK();
     } else {
       cdist_backward_kernel_cuda_impl<scalar_t, dists<scalar_t>::p><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(buffer.data_ptr<scalar_t>(),
       grad.data_ptr<scalar_t>(), x1.data_ptr<scalar_t>(), x2.data_ptr<scalar_t>(), dist.data_ptr<scalar_t>(),
       gs, p, r1, r2, m, count, r_size, l1_size, l2_size);
+      TORCH_CUDA_KERNEL_LAUNCH_CHECK();
     }
   });
-  AT_CUDA_CHECK(cudaGetLastError());
 
   if (x1.dim() > 2) {
     at::sum_out(result, buffer, 1);

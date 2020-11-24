@@ -66,6 +66,11 @@ static void avg_pool3d_out_frame(
             hend = std::min(hend, iheight);
             wend = std::min(wend, iwidth);
 
+            if (tstart >= tend || hstart >= hend || wstart >= wend) {
+              ++op;
+              continue;
+            }
+
             int divide_factor;
             if (divisor_override.has_value()) {
               divide_factor = divisor_override.value();
@@ -505,7 +510,7 @@ Tensor avg_pool3d_backward_cpu(
   bool count_include_pad,
   c10::optional<int64_t> divisor_override)
 {
-  auto gradInput = at::zeros_like(input);
+  auto gradInput = at::zeros_like(input, LEGACY_CONTIGUOUS_MEMORY_FORMAT);
   avg_pool3d_backward_out_cpu_template(
     gradInput,
     gradOutput_,

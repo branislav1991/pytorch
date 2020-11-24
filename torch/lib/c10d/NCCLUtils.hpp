@@ -1,8 +1,34 @@
 #pragma once
 
-#include <nccl.h>
-#include <memory>
+#include <stdio.h>
+#include <stdlib.h>
 
+#include <memory>
+#include <mutex>
+
+#include <nccl.h>
+
+namespace {
+  // Provides additional detail into NCCL error codes based on when these are
+  // thrown in the NCCL codebase.
+const char* errorMessage(ncclResult_t error) {
+  switch (error) {
+    case ncclUnhandledCudaError:
+      return "ncclUnhandledCudaError: Call to CUDA function failed.";
+    case ncclSystemError:
+      return "ncclSystemError: System call (socket, malloc, munmap, etc) failed.";
+    case ncclInternalError:
+      return "ncclInternalError: Internal check failed. This is either a bug in NCCL or due to memory corruption";
+    case ncclInvalidArgument:
+      return "ncclInvalidArgument: Invalid value for an argument (such as invalid pointer, device count, ip:host pair, etc).";
+    case ncclInvalidUsage:
+      return "ncclInvalidUsage: This usually reflects invalid usage of NCCL library (such as too many async ops, too many collectives at once, mixing streams in a group, etc).";
+    default:
+      break;
+  }
+  return "Unknown NCCL error";
+}
+} // namespace
 // Error checking is enabled only for NCCL versions 2.4+ since ncclCommAbort()
 // and ncclCommGetAsyncError() are not supported in earlier versions.
 #if defined(NCCL_MAJOR) && (NCCL_MAJOR == 2) && defined(NCCL_MINOR) && \
@@ -12,14 +38,41 @@
 #define ENABLE_NCCL_ERROR_CHECKING
 #endif
 
-#define C10D_NCCL_CHECK(cmd)                                                \
-  do {                                                                      \
-    ncclResult_t error = cmd;                                               \
-    if (error != ncclSuccess) {                                             \
-      std::string err = "NCCL error in: " + std::string(__FILE__) + ":" +   \
-          std::to_string(__LINE__) + ", " + ncclGetErrorWithVersion(error); \
-      throw std::runtime_error(err);                                        \
-    }                                                                       \
+// P2P is enabled only for NCCL versions 2.7+ since ncclSend()
+// and ncclRecv() are not supported in earlier versions.
+#if defined(NCCL_MAJOR) && (NCCL_MAJOR == 2) && defined(NCCL_MINOR) && \
+    (NCCL_MINOR >= 7)
+#define ENABLE_NCCL_P2P_SUPPORT
+#elif defined(NCCL_MAJOR) && (NCCL_MAJOR >= 3)
+#define ENABLE_NCCL_P2P_SUPPORT
+#endif
+
+// Macro to throw on a non-successful NCCL return value.
+#define C10D_NCCL_CHECK(cmd)                                                  \
+  do {                                                                        \
+    ncclResult_t result = cmd; \
+    if (result != ncclSuccess) {                                              \
+      std::string err = "NCCL error in: " + std::string(__FILE__) + ":" +     \
+          std::to_string(__LINE__) + ", " + ncclGetErrorWithVersion(result) + \
+          "\n" + errorMessage(result);                                        \
+      throw std::runtime_error(err);                                          \
+    }                                                                         \
+  } while (0)
+
+// Macro to print and abort on a non-successful NCCL return value.
+#define C10D_NCCL_ASSERT(cmd)                            \
+  do {                                                   \
+    ncclResult_t result = cmd;                           \
+    if (result != ncclSuccess) {                         \
+      std::string err = ncclGetErrorWithVersion(result); \
+      fprintf(                                           \
+          stderr,                                        \
+          "NCCL error in: %s:%d, %s\n",                  \
+          __FILE__,                                      \
+          __LINE__,                                      \
+          err.c_str());                                  \
+      abort();                                           \
+    }                                                    \
   } while (0)
 
 namespace c10d {
@@ -35,15 +88,18 @@ class NCCLComm {
 
   NCCLComm() : NCCLComm(nullptr) {}
 
-  ~NCCLComm() noexcept(false) {
+  ~NCCLComm() noexcept {
+    // Add lock in this destructor, as aborted_ needs to be read after memory
+    // barrier here.
+    std::unique_lock<std::mutex> lock(mutex_);
     if (ncclComm_ && !aborted_) {
 #ifdef ENABLE_NCCL_ERROR_CHECKING
       // Use ncclCommAbort instead of ncclCommDestroy here since
       // ncclCommDestroy could block forever waiting for work to complete on
       // the communicator.
-      ncclCommAbort();
+      C10D_NCCL_ASSERT(::ncclCommAbort(ncclComm_));
 #else
-      C10D_NCCL_CHECK(::ncclCommDestroy(ncclComm_));
+      C10D_NCCL_ASSERT(::ncclCommDestroy(ncclComm_));
 #endif
     }
   }
@@ -55,29 +111,33 @@ class NCCLComm {
     auto comm = std::make_shared<NCCLComm>();
     C10D_NCCL_CHECK(
         ncclCommInitRank(&(comm->ncclComm_), numRanks, commId, rank));
+    comm->ncclId_ = commId;
     return comm;
+  }
+
+  ncclUniqueId getNcclId() {
+    return ncclId_;
   }
 
   // Must not be copyable
   NCCLComm(const NCCLComm&) = delete;
   NCCLComm& operator=(const NCCLComm&) = delete;
 
+  // Do not support move assignment as there is no valid use case
+  NCCLComm& operator=(NCCLComm&& other) = delete;
+
   // Move constructable
   NCCLComm(NCCLComm&& other) {
+    // Using other's lock, as it reads other's states
+    // Can not use this.mutex_, as this object is being constructed.
+    std::unique_lock<std::mutex> lock(other.mutex_);
     std::swap(ncclComm_, other.ncclComm_);
     std::swap(aborted_, other.aborted_);
     std::swap(ncclAsyncErr_, other.ncclAsyncErr_);
-  }
-
-  // Move assignable
-  NCCLComm& operator=(NCCLComm&& other) {
-    std::swap(ncclComm_, other.ncclComm_);
-    std::swap(aborted_, other.aborted_);
-    std::swap(ncclAsyncErr_, other.ncclAsyncErr_);
-    return *this;
   }
 
   ncclComm_t getNcclComm() {
+    std::unique_lock<std::mutex> lock(mutex_);
     if (aborted_) {
       throw std::runtime_error("NCCL communicator was aborted.");
     }
@@ -85,6 +145,7 @@ class NCCLComm {
   }
 
   void ncclCommAbort() {
+    std::unique_lock<std::mutex> lock(mutex_);
 #ifdef ENABLE_NCCL_ERROR_CHECKING
     if (aborted_) {
       // Should not abort twice.
@@ -106,10 +167,12 @@ class NCCLComm {
   }
 
   bool isAborted() const {
+    std::unique_lock<std::mutex> lock(mutex_);
     return aborted_;
   }
 
   ncclResult_t checkForNcclError() {
+    std::unique_lock<std::mutex> lock(mutex_);
 #ifdef ENABLE_NCCL_ERROR_CHECKING
     if (ncclAsyncErr_ != ncclSuccess) {
       return ncclAsyncErr_;
@@ -124,8 +187,11 @@ class NCCLComm {
 
  protected:
   ncclComm_t ncclComm_;
+  // Unique nccl_id for this communicator.
+  ncclUniqueId ncclId_;
   bool aborted_;
   ncclResult_t ncclAsyncErr_;
+  mutable std::mutex mutex_;
 };
 
 } // namespace c10d

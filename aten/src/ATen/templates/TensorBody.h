@@ -4,8 +4,10 @@
 #include <c10/core/Layout.h>
 #include <c10/core/MemoryFormat.h>
 #include <c10/core/QScheme.h>
+#include <c10/core/Stream.h>
 #include <c10/core/Scalar.h>
 #include <c10/core/ScalarType.h>
+#include <c10/core/ScalarTypeToTypeMeta.h>
 #include <c10/core/Storage.h>
 #include <ATen/core/TensorAccessor.h>
 #include <c10/core/TensorImpl.h>
@@ -16,8 +18,9 @@
 #include <c10/util/intrusive_ptr.h>
 #include <ATen/core/DeprecatedTypePropertiesRegistry.h>
 #include <ATen/core/DeprecatedTypeProperties.h>
-#include <ATen/core/EnableNamedTensor.h>
 #include <ATen/core/NamedTensor.h>
+#include <ATen/core/QuantizerBase.h>
+#include <torch/csrc/WindowsTorchApiMacro.h>
 
 namespace caffe2 {
 class Tensor;
@@ -31,18 +34,36 @@ struct Type;
 class DeprecatedTypeProperties;
 class Tensor;
 } // namespace at
+namespace at {
+namespace indexing {
+struct TensorIndex;
+} // namespace indexing
+} // namespace at
+
+namespace torch { namespace autograd {
+
+struct Node;
+
+}} // namespace torch::autograd
 
 namespace at {
 
 class Tensor;
 using TensorList = ArrayRef<Tensor>;
 
-struct Quantizer;
-// This is temporary typedef to enable Quantizer in aten native function API
-// we'll remove them when we are actually exposing Quantizer class
-// to frontend
-using QuantizerPtr = c10::intrusive_ptr<Quantizer>;
-using ConstQuantizerPtr = const c10::intrusive_ptr<Quantizer>&;
+using Stream = c10::Stream;
+
+namespace impl {
+inline bool variable_excluded_from_dispatch() {
+#ifdef C10_MOBILE
+  // Please read the comment in `VariableFallbackKernel.cpp` about the background of this change.
+  return true;
+#else
+  TORCH_INTERNAL_ASSERT_DEBUG_ONLY(!c10::impl::tls_local_dispatch_key_set().excluded_.has(DispatchKey::Autograd));
+  return c10::impl::tls_local_dispatch_key_set().excluded_.isSupersetOf(c10::autograd_dispatch_keyset);
+#endif
+}
+}
 
 // Tensor is a "generic" object holding a pointer to the underlying TensorImpl object, which
 // has an embedded reference count. In this way, Tensor is similar to boost::intrusive_ptr.
@@ -142,6 +163,16 @@ class CAFFE2_API Tensor {
   //    multiple versions of a defaulted special member functions are not allowed
   // Tensor& operator=(const Tensor&) & = default;
   // Tensor& operator=(Tensor&&) & = default;
+
+  // Also MSVC will wrongly issue the following warning with the aforementioned fix
+  //    warning C4522: 'at::Tensor': multiple assignment operators specified
+  // Let's just skip the warning.
+
+  #ifdef _MSC_VER
+  #pragma warning( push )
+  #pragma warning( disable : 4522 )
+  #endif
+
   Tensor& operator=(const Tensor& x) & {
     impl_ = x.impl_;
     return *this;
@@ -154,6 +185,10 @@ class CAFFE2_API Tensor {
   Tensor& operator=(Scalar v) &&;
   Tensor& operator=(const Tensor&) &&;
   Tensor& operator=(Tensor&&) &&;
+
+  #ifdef _MSC_VER
+  #pragma warning( pop )
+  #endif
 
   bool is_same(const Tensor& other) const noexcept {
     return impl_ == other.impl_;
@@ -173,16 +208,14 @@ class CAFFE2_API Tensor {
   IntArrayRef strides() const {
     return impl_->strides();
   }
-#ifdef BUILD_NAMEDTENSOR
   // See impl::get_opt_names in ATen/NamedTensor.h for docs.
-  optional<DimnameList> opt_names() const {
+  c10::optional<DimnameList> opt_names() const {
     return impl::get_opt_names(unsafeGetTensorImpl());
   }
   // See impl::get_names in ATen/NamedTensor.h for docs.
   DimnameList names() const {
     return impl::get_names(unsafeGetTensorImpl());
   }
-#endif
   int64_t ndimension() const {
     return dim();
   }
@@ -195,9 +228,23 @@ class CAFFE2_API Tensor {
     return impl_->is_non_overlapping_and_dense();
   }
 
-  at::MemoryFormat suggest_memory_format() const {
-    if (impl_->is_strides_like_channels_last()) {
-      return at::MemoryFormat::ChannelsLast;
+  at::MemoryFormat suggest_memory_format(
+      bool channels_last_strides_exact_match = false) const {
+    // Setting channels_last_strides_exact_match to true forces function to
+    // check 0,1 - sized dimension strides.
+    if (!is_mkldnn() && !is_sparse()) {
+      if (impl_->is_strides_like_channels_last()) {
+        if (!channels_last_strides_exact_match ||
+            get_channels_last_strides_2d(sizes()) == strides()) {
+          return at::MemoryFormat::ChannelsLast;
+        }
+      }
+      else if (impl_->is_strides_like_channels_last_3d()) {
+        if (!channels_last_strides_exact_match ||
+            get_channels_last_strides_3d(sizes()) == strides()) {
+          return at::MemoryFormat::ChannelsLast3d;
+        }
+      }
     }
     return at::MemoryFormat::Contiguous;
   }
@@ -208,6 +255,10 @@ class CAFFE2_API Tensor {
   // it reports the memory the tensor would take *if* it were contiguous.
   // Defined to be numel() * itemsize()
   size_t nbytes() const {
+    TORCH_CHECK(layout () != at::kSparse,
+                "nbytes is not defined for sparse tensors.  If you want the size of the constituent " \
+                "tensors, add the nbytes of the indices and values.  If you want the size of the  " \
+                "equivalent dense tensor, multiply numel() by element_size()");
     return impl_->numel() * impl_->itemsize();
   }
 
@@ -222,18 +273,18 @@ class CAFFE2_API Tensor {
   }
 
   // Same as itemsize().  This is the PyTorch naming.
-  size_t element_size() const {
-    return impl_->itemsize();
+  int64_t element_size() const {
+    return static_cast<int64_t>(impl_->itemsize());
   }
 
+  C10_DEPRECATED_MESSAGE("Tensor.type() is deprecated. Instead use Tensor.options(), which in many cases (e.g. in a constructor) is a drop-in replacement. If you were using data from type(), that is now available from Tensor itself, so instead of tensor.type().scalar_type(), use tensor.scalar_type() instead and instead of tensor.type().backend() use tensor.device().")
   DeprecatedTypeProperties & type() const {
     return globalDeprecatedTypePropertiesRegistry().getDeprecatedTypeProperties(
-        tensorTypeIdToBackend(legacyExtractTypeId(type_set())),
-        scalar_type(),
-        is_variable());
+        dispatchKeyToBackend(legacyExtractDispatchKey(key_set())),
+        scalar_type());
   }
-  TensorTypeSet type_set() const {
-    return impl_->type_set();
+  DispatchKeySet key_set() const {
+    return impl_->key_set();
   }
   ScalarType scalar_type() const {
     return typeMetaToScalarType(impl_->dtype());
@@ -250,16 +301,15 @@ class CAFFE2_API Tensor {
   Tensor toType(ScalarType t) const;
   Tensor toBackend(Backend b) const;
 
-  /// Returns true if the `Tensor` is actually a `torch::autograd::Variable`.
-  /// Defined in Type.h because of include order issues.
+  C10_DEPRECATED_MESSAGE("Tensor.is_variable() is deprecated; everything is a variable now. (If you want to assert that variable has been appropriately handled already, use at::impl::variable_excluded_from_dispatch())")
   bool is_variable() const noexcept {
-    return impl_->is_variable();
+    return !at::impl::variable_excluded_from_dispatch();
   }
 
   /// Returns a `Tensor`'s layout. Defined in Type.h
   Layout layout() const noexcept;
 
-  /// Returns a `Tensor`'s dtype (`TypeMeta`). Defined in TensorMethods.h
+  /// Returns a `Tensor`'s dtype (`TypeMeta`). Defined in TensorMethods.cpp
   caffe2::TypeMeta dtype() const noexcept;
 
   /// Returns a `Tensor`'s device.
@@ -280,21 +330,29 @@ class CAFFE2_API Tensor {
   /// Returns if a `Tensor` is mkldnn tensor.
   bool is_mkldnn() const;
 
+  /// Returns if a `Tensor` is vulkan tensor.
+  bool is_vulkan() const;
+
+  /// Returns if a `Tensor` is metal tensor.
+  bool is_metal() const;
+
   /// Returns if a `Tensor` has quantized backend.
   bool is_quantized() const;
+
+  /// Returns if a `Tensor` is a meta tensor.  Meta tensors can
+  /// also have other designations.
+  bool is_meta() const;
 
   /// If a tensor is a quantized tensor, returns its quantizer
   /// TODO: it's not in native_functions.yaml yet as it's not exposed to python
   QuantizerPtr quantizer() const;
 
-#ifdef BUILD_NAMEDTENSOR
   /// Returns if a `Tensor` has any dimension names
   bool has_names() const;
 
   /// Returns a `Tensor`'s dimension names data structure
   const NamedTensorMeta* get_named_tensor_meta() const;
   NamedTensorMeta* get_named_tensor_meta();
-#endif
 
   /// Returns the `TensorOptions` corresponding to this `Tensor`. Defined in
   /// TensorOptions.h.
@@ -324,7 +382,7 @@ class CAFFE2_API Tensor {
   template<typename T, size_t N>
   TensorAccessor<T,N> accessor() const& {
     static_assert(N > 0, "accessor is used for indexing tensor, for scalars use *data_ptr<T>()");
-    TORCH_CHECK(dim() == N, "expected ", N, " dims but tensor has ", dim());
+    TORCH_CHECK(dim() == N, "TensorAccessor expected ", N, " dims but tensor has ", dim());
     return TensorAccessor<T,N>(data_ptr<T>(),sizes().data(),strides().data());
   }
   template<typename T, size_t N>
@@ -338,7 +396,7 @@ class CAFFE2_API Tensor {
   template<typename T, size_t N, template <typename U> class PtrTraits = DefaultPtrTraits, typename index_t = int64_t>
   GenericPackedTensorAccessor<T,N,PtrTraits,index_t> generic_packed_accessor() const& {
     static_assert(N > 0, "accessor is used for indexing tensor, for scalars use *data_ptr<T>()");
-    TORCH_CHECK(dim() == N, "expected ", N, " dims but tensor has ", dim());
+    TORCH_CHECK(dim() == N, "TensorAccessor expected ", N, " dims but tensor has ", dim());
     return GenericPackedTensorAccessor<T,N,PtrTraits,index_t>(static_cast<typename PtrTraits<T>::PtrType>(data_ptr<T>()),sizes().data(),strides().data());
   }
   template<typename T, size_t N, template <typename U> class PtrTraits = DefaultPtrTraits, typename index_t = int64_t>
@@ -367,6 +425,7 @@ class CAFFE2_API Tensor {
   C10_DEPRECATED_MESSAGE("packed_accessor is deprecated, use packed_accessor32 or packed_accessor64 instead")
   GenericPackedTensorAccessor<T,N,PtrTraits,index_t> packed_accessor() && = delete;
 
+  Tensor operator~() const;
   Tensor operator-() const;
   Tensor& operator+=(const Tensor & other);
   Tensor& operator+=(Scalar other);
@@ -376,15 +435,124 @@ class CAFFE2_API Tensor {
   Tensor& operator*=(Scalar other);
   Tensor& operator/=(const Tensor & other);
   Tensor& operator/=(Scalar other);
+  Tensor& operator&=(const Tensor & other);
+  Tensor& operator|=(const Tensor & other);
+  Tensor& operator^=(const Tensor & other);
   Tensor operator[](Scalar index) const;
   Tensor operator[](Tensor index) const;
   Tensor operator[](int64_t index) const;
 
+  Tensor index(ArrayRef<at::indexing::TensorIndex> indices) const;
+  Tensor index(std::initializer_list<at::indexing::TensorIndex> indices) const;
+
+  Tensor & index_put_(ArrayRef<at::indexing::TensorIndex> indices, Tensor const & rhs);
+  Tensor & index_put_(ArrayRef<at::indexing::TensorIndex> indices, Scalar v);
+  Tensor & index_put_(std::initializer_list<at::indexing::TensorIndex> indices, Tensor const & rhs);
+  Tensor & index_put_(std::initializer_list<at::indexing::TensorIndex> indices, Scalar v);
+
   Tensor cpu() const;
   Tensor cuda() const;
   Tensor hip() const;
+  Tensor vulkan() const;
+  Tensor metal() const;
 
   // ~~~~~ Autograd API ~~~~~
+
+  /// \fn bool is_leaf() const;
+  ///
+  /// All Tensors that have `requires_grad()` which is ``false`` will be leaf Tensors by convention.
+  ///
+  /// For Tensors that have `requires_grad()` which is ``true``, they will be leaf Tensors if they were
+  /// created by the user. This means that they are not the result of an operation and so
+  /// `grad_fn()` is `nullptr`.
+  ///
+  /// Only leaf Tensors will have their `grad()` populated during a call to `backward()`.
+  /// To get `grad()` populated for non-leaf Tensors, you can use `retain_grad()`.
+  ///
+  /// Example:
+  /// @code
+  /// auto a = torch::rand(10, torch::requires_grad());
+  /// std::cout << a.is_leaf() << std::endl; // prints `true`
+  ///
+  /// auto b = torch::rand(10, torch::requires_grad()).to(torch::kCUDA);
+  /// std::cout << b.is_leaf() << std::endl; // prints `false`
+  /// // b was created by the operation that cast a cpu Tensor into a cuda Tensor
+  ///
+  /// auto c = torch::rand(10, torch::requires_grad()) + 2;
+  /// std::cout << c.is_leaf() << std::endl; // prints `false`
+  /// // c was created by the addition operation
+  ///
+  /// auto d = torch::rand(10).cuda();
+  /// std::cout << d.is_leaf() << std::endl; // prints `true`
+  /// // d does not require gradients and so has no operation creating it (that is tracked by the autograd engine)
+  ///
+  /// auto e = torch::rand(10).cuda().requires_grad_();
+  /// std::cout << e.is_leaf() << std::endl; // prints `true`
+  /// // e requires gradients and has no operations creating it
+  ///
+  /// auto f = torch::rand(10, torch::device(torch::kCUDA).requires_grad(true));
+  /// std::cout << f.is_leaf() << std::endl; // prints `true`
+  /// // f requires grad, has no operation creating it
+  /// @endcode
+
+  /// \fn void backward(const Tensor & gradient={}, c10::optional<bool> retain_graph=c10::nullopt, bool create_graph=false, c10::optional<TensorList> inputs=c10::nullopt) const;
+  ///
+  /// Computes the gradient of current tensor with respect to graph leaves.
+  ///
+  /// The graph is differentiated using the chain rule. If the tensor is
+  /// non-scalar (i.e. its data has more than one element) and requires
+  /// gradient, the function additionally requires specifying ``gradient``.
+  /// It should be a tensor of matching type and location, that contains
+  /// the gradient of the differentiated function w.r.t. this Tensor.
+  ///
+  /// This function accumulates gradients in the leaves - you might need to
+  /// zero them before calling it.
+  ///
+  /// \param gradient Gradient w.r.t. the
+  ///     tensor. If it is a tensor, it will be automatically converted
+  ///     to a Tensor that does not require grad unless ``create_graph`` is True.
+  ///     None values can be specified for scalar Tensors or ones that
+  ///     don't require grad. If a None value would be acceptable then
+  ///     this argument is optional.
+  /// \param retain_graph If ``false``, the graph used to compute
+  ///     the grads will be freed. Note that in nearly all cases setting
+  ///     this option to True is not needed and often can be worked around
+  ///     in a much more efficient way. Defaults to the value of
+  ///     ``create_graph``.
+  /// \param create_graph If ``true``, graph of the derivative will
+  ///     be constructed, allowing to compute higher order derivative
+  ///     products. Defaults to ``false``.
+  /// \param inputs Inputs w.r.t. which the gradient will be accumulated into
+  ///     ``at::Tensor::grad``. All other Tensors will be ignored. If not
+  ///     provided, the gradient is accumulated into all the leaf Tensors
+  ///     that were used to compute the current tensor. All the provided inputs
+  ///     must be leaf Tensors.
+  void backward(const Tensor & gradient={}, c10::optional<bool> retain_graph=c10::nullopt, bool create_graph=false, c10::optional<TensorList> inputs=c10::nullopt) const {
+    // NB: Adding this wrapper to _backward here because we'd like our
+    // 'backwards' api to accept the 'inputs' argument optionally. Since code gen
+    // currently does not support optional of TensorList our approach is to replace
+    // backward in native_functions.yaml with _backward and call it here instead.
+    if (inputs.has_value()) {
+      TORCH_CHECK(inputs.value().size() > 0, "'inputs' argument to backward cannot be empty")
+      this->_backward(inputs.value(), gradient, retain_graph, create_graph);
+    } else {
+      this->_backward({}, gradient, retain_graph, create_graph);
+    }
+  }
+
+  /// \fn Tensor detach() const;
+  ///
+  /// Returns a new Tensor, detached from the current graph.
+  /// The result will never require gradient.
+
+  /// \fn Tensor & detach_() const;
+  ///
+  /// Detaches the Tensor from the graph that created it, making it a leaf.
+  /// Views cannot be detached in-place.
+
+  /// \fn void retain_grad() const;
+  ///
+  /// Enables .grad() for non-leaf Tensors.
 
   Tensor& set_requires_grad(bool requires_grad) {
     impl_->set_requires_grad(requires_grad);
@@ -394,9 +562,18 @@ class CAFFE2_API Tensor {
     return impl_->requires_grad();
   }
 
-  Tensor& grad() {
-    return impl_->grad();
+  /// Return a mutable reference to the gradient. This is conventionally
+  /// used as `t.grad() = x` to set a gradient to a completely new tensor.
+  /// Note that this function work with a non-const Tensor and is not
+  /// thread safe.
+  Tensor& mutable_grad() {
+    return impl_->mutable_grad();
   }
+
+  /// This function returns an undefined tensor by default and returns a defined tensor
+  /// the first time a call to `backward()` computes gradients for this Tensor.
+  /// The attribute will then contain the gradients computed and future calls
+  /// to `backward()` will accumulate (add) gradients into it.
   const Tensor& grad() const {
     return impl_->grad();
   }
@@ -407,6 +584,18 @@ class CAFFE2_API Tensor {
   //example
   //Tensor * add(Tensor & b);
   ${tensor_method_declarations}
+
+  // Special C++ only overloads for std()-like functions (See gh-40287)
+  // These are needed because int -> bool conversion takes precedence over int -> IntArrayRef
+  // So, for example std(0) would select the std(unbiased=False) overload
+
+  Tensor var(int dim) const {
+    return var(IntArrayRef{dim});
+  }
+
+  Tensor std(int dim) const {
+    return std(IntArrayRef{dim});
+  }
 
   // We changed .dtype() to return a TypeMeta in #12766. Ideally, we want the
   // at::kDouble and its friends to be TypeMeta's, but that hasn't happened yet.
@@ -421,9 +610,110 @@ class CAFFE2_API Tensor {
   }
 
   template <typename F, typename... Args>
-  auto m(F func, Args&&... params) const -> decltype(func(*this, std::forward<Args>(params)...)) {
+  decltype(auto) m(F func, Args&&... params) const {
     return func(*this, std::forward<Args>(params)...);
   }
+
+  /// NOTE: This is similar to the legacy `.data()` function on `Variable`, and is intended
+  /// to be used from functions that need to access the `Variable`'s equivalent `Tensor`
+  /// (i.e. `Tensor` that shares the same storage and tensor metadata with the `Variable`).
+  ///
+  /// One notable difference with the legacy `.data()` function is that changes to the
+  /// returned `Tensor`'s tensor metadata (e.g. sizes / strides / storage / storage_offset)
+  /// will not update the original `Variable`, due to the fact that this function
+  /// shallow-copies the `Variable`'s underlying TensorImpl.
+  at::Tensor tensor_data() const;
+
+  /// NOTE: `var.variable_data()` in C++ has the same semantics as `tensor.data`
+  /// in Python, which create a new `Variable` that shares the same storage and
+  /// tensor metadata with the original `Variable`, but with a completely new
+  /// autograd history.
+  ///
+  /// NOTE: If we change the tensor metadata (e.g. sizes / strides /
+  /// storage / storage_offset) of a variable created from `var.variable_data()`, those
+  /// changes will not update the original variable `var`. In `.variable_data()`, we set
+  /// `allow_tensor_metadata_change_` to false to make such changes explicitly illegal,
+  /// in order to prevent users from changing metadata of `var.variable_data()`
+  /// and expecting the original variable `var` to also be updated.
+  at::Tensor variable_data() const;
+
+  // Gradient Node and Edges
+  //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+  /// Gets the gradient function of the `Variable`. If this is a leaf variable,
+  /// the pointer returned will be null.
+  ///
+  /// For View Variables:
+  /// Gets the up-to-date grad_fn. If the shared data or base was modified, we
+  /// re-create the grad_fn to express the up-to-date view relationship between
+  /// this and the base Variable.
+  const std::shared_ptr<torch::autograd::Node>& grad_fn() const;
+
+  // Hooks
+  //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+  template <typename T>
+  using hook_return_void_t = std::enable_if_t<std::is_void<typename std::result_of<T&(Tensor)>::type>::value, unsigned>;
+  template <typename T>
+  using hook_return_var_t = std::enable_if_t<std::is_same<typename std::result_of<T&(Tensor)>::type, Tensor>::value, unsigned>;
+
+  /// Registers a backward hook.
+  ///
+  /// The hook will be called every time a gradient with respect to the Tensor is computed.
+  /// The hook should have one of the following signature:
+  /// ```
+  /// hook(Tensor grad) -> Tensor
+  /// ```
+  /// ```
+  /// hook(Tensor grad) -> void
+  /// ```
+  /// The hook should not modify its argument, but it can optionally return a new gradient
+  /// which will be used in place of `grad`.
+  ///
+  /// This function returns the index of the hook in the list which can be used to remove hook.
+  ///
+  /// Example:
+  /// @code
+  /// auto v = torch::tensor({0., 0., 0.}, torch::requires_grad());
+  /// auto h = v.register_hook([](torch::Tensor grad){ return grad * 2; }); // double the gradient
+  /// v.backward(torch::tensor({1., 2., 3.}));
+  /// // This prints:
+  /// // ```
+  /// //  2
+  /// //  4
+  /// //  6
+  /// // [ CPUFloatType{3} ]
+  /// // ```
+  /// std::cout << v.grad() << std::endl;
+  /// v.remove_hook(h);  // removes the hook
+  /// @endcode
+  template <typename T>
+  hook_return_void_t<T> register_hook(T&& hook) const;
+  template <typename T>
+  hook_return_var_t<T> register_hook(T&& hook) const;
+
+private:
+  unsigned _register_hook(std::function<Tensor(const Tensor&)> hook) const;
+
+public:
+
+  /// Remove hook at given position
+  void remove_hook(unsigned pos) const;
+
+  // View Variables
+  //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+  /// Returns true if this `Variable` is a view of another `Variable`.
+  bool is_view() const;
+
+  /// Returns the `Variable` that this `Variable` is a view of. If this
+  /// `Variable` is not a view, throw a `std::runtime_error`.
+  const Tensor& _base() const;
+
+  // Miscellaneous
+  //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+  const std::string& name() const;
 
 protected:
   friend class ::caffe2::Tensor;
@@ -431,6 +721,24 @@ protected:
   void enforce_invariants();
   c10::intrusive_ptr<TensorImpl, UndefinedTensorImpl> impl_;
 };
+
+int64_t get_device(Tensor self);
+
+template <typename T>
+auto Tensor::register_hook(T&& hook) const -> Tensor::hook_return_void_t<T> {
+  // Return the grad argument in case of a hook with void return type to have an
+  // std::function with Tensor return type
+  std::function<void(Tensor)> fn(hook);
+  return _register_hook([fn](const Tensor& grad) {
+    fn(grad);
+    return Tensor();
+  });
+}
+
+template <typename T>
+auto Tensor::register_hook(T&& hook) const -> Tensor::hook_return_var_t<T> {
+  return _register_hook(hook);
+}
 
 namespace detail {
 // Helper creator for Tensor class which doesn't requires the users to pass
@@ -443,8 +751,8 @@ Tensor make_tensor(Args&&... args) {
 
 } // namespace detail
 
-static inline TensorTypeId legacyExtractTypeId(const Tensor& t) {
-  return legacyExtractTypeId(t.type_set());
+static inline DispatchKey legacyExtractDispatchKey(const Tensor& t) {
+  return legacyExtractDispatchKey(t.key_set());
 }
 
 } // namespace at

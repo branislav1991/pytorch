@@ -1,9 +1,9 @@
 ## @package batch_softmax_loss
 # Module caffe2.python.layers.batch_softmax_loss
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-from __future__ import unicode_literals
+
+
+
+
 
 from caffe2.python import core, schema
 from caffe2.python.layers.layers import ModelLayer
@@ -19,6 +19,7 @@ class BatchSoftmaxLoss(ModelLayer):
         label_smoothing_matrix=None,
         label_prob=False,
         scale=1.0,
+        average_by_batch_size=False,
         **kwargs
     ):
         super(BatchSoftmaxLoss, self).__init__(
@@ -33,6 +34,7 @@ class BatchSoftmaxLoss(ModelLayer):
         )
         self.label_prob = label_prob
         self.scale = scale
+        self.average_by_batch_size = average_by_batch_size
 
         # label smoothing matrix: a K * K matrix where K is the label
         # cardinality; (i, j) element is the value of for label i
@@ -122,4 +124,5 @@ class BatchSoftmaxLoss(ModelLayer):
             self.output_schema.field_blobs(),
             label_prob=self.label_prob,
             scale=self.scale,
+            average_by_batch_size=self.average_by_batch_size,
         )

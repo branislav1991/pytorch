@@ -1,11 +1,51 @@
-from __future__ import absolute_import, division, print_function, unicode_literals
 
+from typing import Optional
 import multiprocessing
 import multiprocessing.connection
 import signal
 import sys
+import warnings
 
-from . import _prctl_pr_set_pdeathsig
+from . import _prctl_pr_set_pdeathsig  # type: ignore[attr-defined]
+
+
+class ProcessException(Exception):
+    __slots__ = ["error_index", "error_pid"]
+
+    def __init__(self, msg: str, error_index: int, pid: int):
+        super().__init__(msg)
+        self.error_index = error_index
+        self.pid = pid
+
+
+class ProcessRaisedException(ProcessException):
+    """
+    Exception is thrown when the process failed due to exception
+    raised by the code.
+    """
+    def __init__(
+        self,
+        msg: str,
+        error_index: int,
+        error_pid: int,
+    ):
+        super().__init__(msg, error_index, error_pid)
+
+
+class ProcessExitedException(ProcessException):
+    """
+    Exception is thrown when the process failed due to signal
+    or exited with a specific code.
+    """
+    __slots__ = ["exit_code"]
+
+    def __init__(
+            self, msg: str, error_index: int, error_pid: int,
+            exit_code: int, signal_name: Optional[str] = None
+    ):
+        super().__init__(msg, error_index, error_pid)
+        self.exit_code = exit_code
+        self.signal_name = signal_name
 
 
 def _wrap(fn, i, args, error_queue):
@@ -34,14 +74,14 @@ def _python_version_check():
     if not _supports_context:
         raise RuntimeError("Requires python 3.4 or higher to use "
                            "torch.multiprocessing.spawn and "
-                           "torch.multiprocessing.SpawnContext helper "
+                           "torch.multiprocessing.ProcessContext helper "
                            "to launch multiple processes. If you are using "
                            "this for distributed training and have a lower "
                            "version of python, please use "
                            "torch.distributed.launch instead.")
 
 
-class SpawnContext:
+class ProcessContext:
     def __init__(self, processes, error_queues):
         _python_version_check()
         self.error_queues = error_queues
@@ -98,27 +138,75 @@ class SpawnContext:
             process.join()
 
         # There won't be an error on the queue if the process crashed.
+        failed_process = self.processes[error_index]
         if self.error_queues[error_index].empty():
             exitcode = self.processes[error_index].exitcode
             if exitcode < 0:
                 name = signal.Signals(-exitcode).name
-                raise Exception(
+                raise ProcessExitedException(
                     "process %d terminated with signal %s" %
-                    (error_index, name)
+                    (error_index, name),
+                    error_index=error_index,
+                    error_pid=failed_process.pid,
+                    exit_code=exitcode,
+                    signal_name=name
                 )
             else:
-                raise Exception(
+                raise ProcessExitedException(
                     "process %d terminated with exit code %d" %
-                    (error_index, exitcode)
+                    (error_index, exitcode),
+                    error_index=error_index,
+                    error_pid=failed_process.pid,
+                    exit_code=exitcode
                 )
 
         original_trace = self.error_queues[error_index].get()
         msg = "\n\n-- Process %d terminated with the following error:\n" % error_index
         msg += original_trace
-        raise Exception(msg)
+        raise ProcessRaisedException(msg, error_index, failed_process.pid)
 
 
-def spawn(fn, args=(), nprocs=1, join=True, daemon=False):
+class SpawnContext(ProcessContext):
+    def __init__(self, processes, error_queues):
+        warnings.warn('SpawnContext is renamed to ProcessContext since 1.4 release.')
+        super(SpawnContext, self).__init__(processes, error_queues)
+    pass
+
+
+# Note: [start_processes]
+# mp.start_processes handles both start_method='spawn' and 'fork'. It's supposed to be a
+# more generalized API than mp.spawn. Currently we only document mp.spawn as it's the
+# CUDA compatible start_method. However, in environments like Ipython notebooks, 'fork'
+# works better than 'spawn'. Every helper function we created for mp.spawn is indeed
+# general enough, and backends like XLA can reuse them in Colab notebooks as well.
+# Currently we only add this API first, we can consider adding it to documentation as
+# needed in the future.
+def start_processes(fn, args=(), nprocs=1, join=True, daemon=False, start_method='spawn'):
+    _python_version_check()
+    mp = multiprocessing.get_context(start_method)
+    error_queues = []
+    processes = []
+    for i in range(nprocs):
+        error_queue = mp.SimpleQueue()
+        process = mp.Process(
+            target=_wrap,
+            args=(fn, i, args, error_queue),
+            daemon=daemon,
+        )
+        process.start()
+        error_queues.append(error_queue)
+        processes.append(process)
+
+    context = ProcessContext(processes, error_queues)
+    if not join:
+        return context
+
+    # Loop on join until it returns True or raises an exception.
+    while not context.join():
+        pass
+
+
+def spawn(fn, args=(), nprocs=1, join=True, daemon=False, start_method='spawn'):
     r"""Spawns ``nprocs`` processes that run ``fn`` with ``args``.
 
     If one of the processes exits with a non-zero exit status, the
@@ -142,31 +230,18 @@ def spawn(fn, args=(), nprocs=1, join=True, daemon=False):
         join (bool): Perform a blocking join on all processes.
         daemon (bool): The spawned processes' daemon flag. If set to True,
                        daemonic processes will be created.
+        start_method (string): (deprecated) this method will always use ``spawn``
+                               as the start method. To use a different start method
+                               use ``start_processes()``.
 
     Returns:
         None if ``join`` is ``True``,
-        :class:`~SpawnContext` if ``join`` is ``False``
+        :class:`~ProcessContext` if ``join`` is ``False``
 
     """
-    _python_version_check()
-    mp = multiprocessing.get_context('spawn')
-    error_queues = []
-    processes = []
-    for i in range(nprocs):
-        error_queue = mp.SimpleQueue()
-        process = mp.Process(
-            target=_wrap,
-            args=(fn, i, args, error_queue),
-            daemon=daemon,
-        )
-        process.start()
-        error_queues.append(error_queue)
-        processes.append(process)
-
-    spawn_context = SpawnContext(processes, error_queues)
-    if not join:
-        return spawn_context
-
-    # Loop on join until it returns True or raises an exception.
-    while not spawn_context.join():
-        pass
+    if start_method != 'spawn':
+        msg = ('This method only supports start_method=spawn (got: %s).\n'
+               'To use a different start_method use:\n\t\t'
+               ' torch.multiprocessing.start_process(...)' % start_method)
+        warnings.warn(msg)
+    return start_processes(fn, args, nprocs, join, daemon, start_method='spawn')

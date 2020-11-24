@@ -1,10 +1,9 @@
-from __future__ import absolute_import, division, print_function, unicode_literals
 
 import torch
 import torch.onnx.symbolic_helper as sym_help
 import torch.onnx.symbolic_opset9 as sym_opset9
 
-from torch.onnx.symbolic_helper import parse_args, _unimplemented, _black_list_in_opset, _try_get_scalar_type
+from torch.onnx.symbolic_helper import parse_args, _unimplemented, _block_list_in_opset, _try_get_scalar_type
 from torch.onnx.symbolic_opset9 import _cast_Float
 
 import warnings
@@ -39,18 +38,19 @@ import warnings
 #   Upsample: moved scales from attribute to input.
 #   Scan
 
-black_listed_operators = [
+block_listed_operators = [
     "nonzero", "where", "scatter", "scatter_add", "erf", "sign", "isnan", "gather",
     "arange", "masked_fill",
     "index_fill", "index_copy"
 ]
 
-for black_listed_op in black_listed_operators:
-    vars()[black_listed_op] = _black_list_in_opset(black_listed_op)
+for block_listed_op in block_listed_operators:
+    vars()[block_listed_op] = _block_list_in_opset(block_listed_op)
 
 
 def _interpolate(name, dim, interpolate_mode):
-    def symbolic_fn(g, input, output_size, align_corners=None):
+    def symbolic_fn(g, input, output_size, *args):
+        scales, align_corners = sym_help._get_interpolate_attributes(g, interpolate_mode, args)
         sym_help._interpolate_warning(interpolate_mode)
         align_corners = sym_help._maybe_get_scalar(align_corners)
         if align_corners:
@@ -58,7 +58,7 @@ def _interpolate(name, dim, interpolate_mode):
         output_size = sym_help._maybe_get_const(output_size, 'is')
         if sym_help._is_value(output_size):
             return _unimplemented(name, "torch._C.Value (output_size) indexing")
-        else:
+        if scales is None:
             scales = [1. if i < 2 else
                       float(output_size[-(dim - i)]) / float(input.type().sizes()[-(dim - i)])
                       for i in range(0, dim)]
@@ -74,7 +74,7 @@ upsample_bilinear2d = _interpolate('upsample_bilinear2d', 4, "linear")
 upsample_trilinear3d = _interpolate('upsample_trilinear3d', 5, "linear")
 
 
-def __interpolate(g, input, size, scale_factor, mode , align_corners):
+def __interpolate(g, input, size, scale_factor, mode, align_corners, recompute_scale_factor):
     align_corners = sym_help._maybe_get_const(align_corners, 'b')
     if not sym_help._is_none(align_corners) and align_corners:
         return _unimplemented("interpolate", "align_corners == True")
@@ -182,20 +182,6 @@ def addmm(g, self, mat1, mat2, beta, alpha):
         return g.op("Gemm", mat1, mat2, self, beta_f=sym_help._scalar(beta), alpha_f=sym_help._scalar(alpha))
 
 
-def view(g, self, size):
-    size = sym_help._maybe_get_const(size, 'is')
-    if sym_help._is_value(size):
-        shape = size
-    else:
-        if self.isCompleteTensor():
-            self_sizes = self.type().sizes()
-            if self_sizes and len(size) == 2 and self_sizes[0] == size[0]:
-                old_type, self = _try_cast_integer_to_float(g, self)
-                return _cast_to_type(g, g.op("Flatten", self, axis_i=1), old_type)
-        shape = g.op("Constant", value_t=torch.LongTensor(size))
-    return g.op("Reshape", self, shape)
-
-
 def flatten(g, input, start_dim, end_dim):
     start_dim_i = sym_help._get_const(start_dim, 'i', 'start_dim')
     end_dim_i = sym_help._get_const(end_dim, 'i', 'end_dim')
@@ -245,8 +231,8 @@ def zeros(g, sizes, dtype, layout, device, pin_memory=False):
     return _constant_fill(g, sizes, dtype, 0)
 
 
-@parse_args('v', 'i', 'v', 'v', 'v')
-def zeros_like(g, input, dtype, layout, device, pin_memory=False):
+@parse_args('v', 'i', 'v', 'v', 'v', 'v')
+def zeros_like(g, input, dtype, layout, device, pin_memory=False, memory_format=None):
     shape = g.op("Shape", input)
     return _constant_fill(g, shape, dtype, 0)
 
@@ -256,8 +242,8 @@ def ones(g, sizes, dtype, layout, device, pin_memory=False):
     return _constant_fill(g, sizes, dtype, 1)
 
 
-@parse_args('v', 'i', 'v', 'v', 'v')
-def ones_like(g, input, dtype, layout, device, pin_memory=False):
+@parse_args('v', 'i', 'v', 'v', 'v', 'v')
+def ones_like(g, input, dtype, layout, device, pin_memory=False, memory_format=None):
     shape = g.op("Shape", input)
     return _constant_fill(g, shape, dtype, 1)
 
@@ -272,7 +258,23 @@ def full(g, sizes, value, dtype, layout, device, pin_memory=False):
         return _constant_fill(g, sizes, dtype, const_value)
 
 
-@parse_args('v', 'f', 'i', 'v', 'v', 'v')
-def full_like(g, input, fill_value, dtype, layout, device, pin_memory=False):
+@parse_args('v', 'f', 'i', 'v', 'v', 'v', 'v')
+def full_like(g, input, fill_value, dtype, layout, device, pin_memory=False, memory_format=None):
     shape = g.op("Shape", input)
     return _constant_fill(g, shape, dtype, fill_value)
+
+
+def repeat(g, self, repeats):
+    if not sym_help._is_value(repeats):
+        repeats = g.op("Constant", value_t=torch.LongTensor(repeats))
+    if sym_help._is_packed_list(repeats):  
+        repeat_size_len = len(sym_help._unpack_list(repeats))
+    else:
+        const_repeats = sym_help._maybe_get_const(repeats, 'is')
+        repeat_size_len = len(const_repeats)
+    if self.isCompleteTensor():
+        sizes = self.type().sizes()
+        diff_dims = repeat_size_len - len(sizes)
+        if diff_dims > 0:
+            self = sym_opset9.view(g, self, g.op("Constant", value_t=torch.tensor([1] * diff_dims + sizes)))
+    return g.op("Tile", self, repeats)

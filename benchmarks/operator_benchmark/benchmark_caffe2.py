@@ -1,15 +1,9 @@
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-from __future__ import unicode_literals
-
 from caffe2.python import workspace
 from caffe2.python import core
 from caffe2.proto import caffe2_pb2
-import benchmark_core
 import benchmark_utils
 from collections import namedtuple
-from benchmark_test_generator import _generate_test
+from benchmark_test_generator import _register_test
 
 """Caffe2 performance microbenchmarks.
 
@@ -99,6 +93,10 @@ class Caffe2BenchmarkBase(object):
             Caffe2BenchmarkBase.test_index += 1
         return name
 
+    def extract_inputs_tuple(self):
+        # add a dummy function here to match the interface of TorchBenchmarkBase
+        pass
+
 
 class Caffe2OperatorTestCase(object):
     """ This class includes all the information needed to benchmark an operator.
@@ -113,7 +111,7 @@ class Caffe2OperatorTestCase(object):
         self.test_config = test_config
         self.framework = "Caffe2"
 
-    def run_forward(self, num_runs, print_per_iter=False):
+    def run_forward(self, num_runs, print_per_iter=False, cuda_sync=False):
         """ Run the forward path of an operator in a loop
         """
         with core.DeviceScope(self.op_bench.dev):
@@ -121,7 +119,7 @@ class Caffe2OperatorTestCase(object):
         if not workspace.RunOperatorMultiple(op, num_runs):
             raise ValueError("Unable to run operator test case: {}".format(self.test_name))
 
-    def run_backward(self, num_runs):
+    def run_backward(self, num_runs, print_per_iter=False):
         """ Run the backward path of an operator in a loop
         """
         with core.DeviceScope(self.op_bench.dev):
@@ -133,9 +131,12 @@ class Caffe2OperatorTestCase(object):
         pass
 
 
-def register_caffe2_op_test_case(op_bench, test_config):
+def create_caffe2_op_test_case(op_bench, test_config):
     test_case = Caffe2OperatorTestCase(op_bench, test_config)
-    benchmark_core._register_test(test_case)
+    test_config = test_case.test_config
+    op = test_case.op_bench
+    func_name = "{}{}{}".format(op.module_name(), test_case.framework, str(test_config))
+    return (func_name, test_case)
 
 
 OpMeta = namedtuple("OpMeta", "op_type num_inputs input_dims input_types \
@@ -143,7 +144,7 @@ OpMeta = namedtuple("OpMeta", "op_type num_inputs input_dims input_types \
 
 def generate_c2_test_from_ops(ops_metadata, bench_op, tags):
     """
-    This function is used to generate Caffe2 tests based on the meatdata
+    This function is used to generate Caffe2 tests based on the metadata
     of operators. The metadata includes seven fields which are 1) op_type:
     the name of the operator. 2) num_inputs: the number of input blobs.
     3) input_dims: a dictionary which includes the shapes of the input blobs.
@@ -180,7 +181,7 @@ def generate_c2_test_from_ops(ops_metadata, bench_op, tags):
             str(op_metadata.args))
         test_config = TestConfig(test_name, input_config, tags, run_backward=False)
         if op is not None:
-            register_caffe2_op_test_case(
+            create_caffe2_op_test_case(
                 op,
                 test_config)
 
@@ -188,12 +189,12 @@ def generate_c2_test_from_ops(ops_metadata, bench_op, tags):
 def generate_c2_test(configs, c2_bench_op):
     """ This function creates Caffe2 op test based on the given operator
     """
-    _generate_test(configs, c2_bench_op, register_caffe2_op_test_case,
-                   run_backward=False)
+    return _register_test(configs, c2_bench_op, create_caffe2_op_test_case,
+                          False)
 
 
 def generate_c2_gradient_test(configs, c2_bench_op):
     """ This function creates Caffe2 op test based on the given operator
     """
-    _generate_test(configs, c2_bench_op, register_caffe2_op_test_case,
-                   run_backward=True)
+    return _register_test(configs, c2_bench_op, create_caffe2_op_test_case,
+                          True)

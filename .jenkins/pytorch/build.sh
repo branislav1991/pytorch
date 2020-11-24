@@ -7,33 +7,25 @@
 # shellcheck disable=SC2034
 COMPACT_JOB_NAME="${BUILD_ENVIRONMENT}"
 
+# Temp: use new sccache
+if [[ -n "$IN_CI" && "$BUILD_ENVIRONMENT" == *rocm* ]]; then
+  # Download customized sccache
+  sudo curl --retry 3 http://repo.radeon.com/misc/.sccache_amd/sccache -o /opt/cache/bin/sccache
+  sudo chmod 755 /opt/cache/bin/sccache
+fi
+
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
-
-# For distributed, four environmental configs:
-# (1) build with only NCCL
-# (2) build with NCCL and MPI
-# (3) build with only MPI
-# (4) build with neither
-if [[ "$BUILD_ENVIRONMENT" == *-xenial-cuda9-* ]]; then
-  # TODO: move this to Docker
-  sudo apt-get -qq update
-  sudo apt-get -qq install --allow-downgrades --allow-change-held-packages libnccl-dev=2.2.13-1+cuda9.0 libnccl2=2.2.13-1+cuda9.0
-fi
-
-if [[ "$BUILD_ENVIRONMENT" == *-xenial-cuda9*gcc7* ]] || [[ "$BUILD_ENVIRONMENT" == *-xenial-cuda9-* ]] || [[ "$BUILD_ENVIRONMENT" == *-trusty-py2.7.9* ]]; then
-  # TODO: move this to Docker
-  sudo apt-get -qq update
-  if [[ "$BUILD_ENVIRONMENT" == *-trusty-py2.7.9* ]]; then
-    sudo apt-get -qq install openmpi-bin libopenmpi-dev
-  else
-    sudo apt-get -qq install --allow-downgrades --allow-change-held-packages openmpi-bin libopenmpi-dev
-  fi
-  sudo apt-get -qq install --no-install-recommends openssh-client openssh-server
-  sudo mkdir -p /var/run/sshd
-fi
 
 if [[ "$BUILD_ENVIRONMENT" == *-linux-xenial-py3-clang5-asan* ]]; then
   exec "$(dirname "${BASH_SOURCE[0]}")/build-asan.sh" "$@"
+fi
+
+if [[ "$BUILD_ENVIRONMENT" == *-mobile-*build* ]]; then
+  exec "$(dirname "${BASH_SOURCE[0]}")/build-mobile.sh" "$@"
+fi
+
+if [[ "$BUILD_ENVIRONMENT" == *-mobile-code-analysis* ]]; then
+  exec "$(dirname "${BASH_SOURCE[0]}")/build-mobile-code-analysis.sh" "$@"
 fi
 
 echo "Python version:"
@@ -45,19 +37,57 @@ gcc --version
 echo "CMake version:"
 cmake --version
 
+if [[ "$BUILD_ENVIRONMENT" == *cuda* ]]; then
+  echo "NVCC version:"
+  nvcc --version
+fi
+
+if [[ "$BUILD_ENVIRONMENT" == *coverage* ]]; then
+  # enable build option in CMake
+  export USE_CPP_CODE_COVERAGE=ON
+fi
+
 # TODO: Don't run this...
 pip_install -r requirements.txt || true
+
+# Enable LLVM dependency for TensorExpr testing
+export USE_LLVM=/opt/llvm
+export LLVM_DIR=/opt/llvm/lib/cmake/llvm
 
 # TODO: Don't install this here
 if ! which conda; then
   # In ROCm CIs, we are doing cross compilation on build machines with
   # intel cpu and later run tests on machines with amd cpu.
   # Also leave out two builds to make sure non-mkldnn builds still work.
-  if [[ "$BUILD_ENVIRONMENT" != *rocm* && "$BUILD_ENVIRONMENT" != *-trusty-py3.5-* && "$BUILD_ENVIRONMENT" != *-xenial-cuda9-cudnn7-py3-* ]]; then
+  if [[ "$BUILD_ENVIRONMENT" != *rocm* && "$BUILD_ENVIRONMENT" != *-trusty-py3.5-* && "$BUILD_ENVIRONMENT" != *-xenial-cuda10.1-cudnn7-py3-* ]]; then
     pip_install mkl mkl-devel
     export USE_MKLDNN=1
   else
     export USE_MKLDNN=0
+  fi
+fi
+
+if [[ "$BUILD_ENVIRONMENT" == *libtorch* ]]; then
+  POSSIBLE_JAVA_HOMES=()
+  POSSIBLE_JAVA_HOMES+=(/usr/local)
+  POSSIBLE_JAVA_HOMES+=(/usr/lib/jvm/java-8-openjdk-amd64)
+  POSSIBLE_JAVA_HOMES+=(/Library/Java/JavaVirtualMachines/*.jdk/Contents/Home)
+  # Add the Windows-specific JNI
+  POSSIBLE_JAVA_HOMES+=("$PWD/.circleci/windows-jni/")
+  for JH in "${POSSIBLE_JAVA_HOMES[@]}" ; do
+    if [[ -e "$JH/include/jni.h" ]] ; then
+      # Skip if we're not on Windows but haven't found a JAVA_HOME
+      if [[ "$JH" == "$PWD/.circleci/windows-jni/" && "$OSTYPE" != "msys" ]] ; then
+        break
+      fi
+      echo "Found jni.h under $JH"
+      export JAVA_HOME="$JH"
+      export BUILD_JNI=ON
+      break
+    fi
+  done
+  if [ -z "$JAVA_HOME" ]; then
+    echo "Did not find jni.h"
   fi
 fi
 
@@ -74,20 +104,29 @@ if [[ "${BUILD_ENVIRONMENT}" == *-android* ]]; then
   elif [[ "${BUILD_ENVIRONMENT}" == *-x86_64* ]]; then
     build_args+=("-DANDROID_ABI=x86_64")
   fi
-  export BUILD_PYTORCH_MOBILE=1
+  if [[ "${BUILD_ENVIRONMENT}" == *vulkan* ]]; then
+    build_args+=("-DUSE_VULKAN=ON")
+  fi
   exec ./scripts/build_android.sh "${build_args[@]}" "$@"
 fi
 
+if [[ "$BUILD_ENVIRONMENT" != *android* && "$BUILD_ENVIRONMENT" == *vulkan-linux* ]]; then
+  export USE_VULKAN=1
+  export VULKAN_SDK=/var/lib/jenkins/vulkansdk/
+fi
+
 if [[ "$BUILD_ENVIRONMENT" == *rocm* ]]; then
-  # When hcc runs out of memory, it silently exits without stopping
-  # the build process, leaving undefined symbols in the shared lib
-  # which will cause undefined symbol errors when later running
-  # tests. Setting MAX_JOBS to smaller number to make CI less flaky.
-  export MAX_JOBS=4
+  # hcc used to run out of memory, silently exiting without stopping
+  # the build process, leaving undefined symbols in the shared lib,
+  # causing undefined symbol errors when later running tests.
+  # We used to set MAX_JOBS to 4 to avoid, but this is no longer an issue.
+  if [ -z "$MAX_JOBS" ]; then
+    export MAX_JOBS=$(($(nproc) - 1))
+  fi
 
   # ROCm CI is using Caffe2 docker images, which needs these wrapper
   # scripts to correctly use sccache.
-  if [ -n "${SCCACHE_BUCKET}" ]; then
+  if [[ -n "${SCCACHE_BUCKET}" && -z "$IN_CI" ]]; then
     mkdir -p ./sccache
 
     SCCACHE="$(which sccache)"
@@ -111,11 +150,27 @@ if [[ "$BUILD_ENVIRONMENT" == *rocm* ]]; then
     export PATH="$CACHE_WRAPPER_DIR:$PATH"
   fi
 
+  if [[ -n "$IN_CI" ]]; then
+      # Set ROCM_ARCH to gfx900 and gfx906 for CI builds
+      echo "Limiting PYTORCH_ROCM_ARCH to gfx90[06] for CI builds"
+      export PYTORCH_ROCM_ARCH="gfx900;gfx906"
+  fi
+
   python tools/amd_build/build_amd.py
   python setup.py install --user
 
-  # runtime compilation of MIOpen kernels manages to crash sccache - hence undo the wrapping
-  bash tools/amd_build/unwrap_clang.sh
+  # remove sccache wrappers post-build; runtime compilation of MIOpen kernels does not yet fully support them
+  sudo rm -f /opt/cache/bin/cc
+  sudo rm -f /opt/cache/bin/c++
+  sudo rm -f /opt/cache/bin/gcc
+  sudo rm -f /opt/cache/bin/g++
+  pushd /opt/rocm/llvm/bin
+  if [[ -d original ]]; then
+    sudo mv original/clang .
+    sudo mv original/clang++ .
+  fi
+  sudo rm -rf original
+  popd
 
   exit 0
 fi
@@ -123,7 +178,7 @@ fi
 # sccache will fail for CUDA builds if all cores are used for compiling
 # gcc 7 with sccache seems to have intermittent OOM issue if all cores are used
 if [ -z "$MAX_JOBS" ]; then
-  if ([[ "$BUILD_ENVIRONMENT" == *cuda* ]] || [[ "$BUILD_ENVIRONMENT" == *gcc7* ]]) && which sccache > /dev/null; then
+  if { [[ "$BUILD_ENVIRONMENT" == *cuda* ]] || [[ "$BUILD_ENVIRONMENT" == *gcc7* ]]; } && which sccache > /dev/null; then
     export MAX_JOBS=$(($(nproc) - 1))
   fi
 fi
@@ -135,8 +190,9 @@ if [[ "$BUILD_ENVIRONMENT" == *ppc64le* ]]; then
   export TORCH_CUDA_ARCH_LIST="6.0"
 fi
 
-if [[ "$BUILD_ENVIRONMENT" == *xenial-py3.6-gcc5.4* ]]; then
-  export DEBUG=1
+if [[ "${BUILD_ENVIRONMENT}" == *clang* ]]; then
+  export CC=clang
+  export CXX=clang++
 fi
 
 # Patch required to build xla
@@ -145,80 +201,90 @@ if [[ "${BUILD_ENVIRONMENT}" == *xla* ]]; then
   ./xla/scripts/apply_patches.sh
 fi
 
-if [[ "${BUILD_ENVIRONMENT}" == *clang* ]]; then
-  export CC=clang
-  export CXX=clang++
-fi
+if [[ "$BUILD_ENVIRONMENT" == *-bazel-* ]]; then
+  set -e
 
+  get_bazel
 
-# check that setup.py would fail with bad arguments
-echo "The next three invocations are expected to fail with invalid command error messages."
-( ! get_exit_code python setup.py bad_argument )
-( ! get_exit_code python setup.py clean] )
-( ! get_exit_code python setup.py clean bad_argument )
-
-if [[ "$BUILD_ENVIRONMENT" != *libtorch* ]]; then
-
-  # ppc64le build fails when WERROR=1
-  # set only when building other architectures
-  # only use for "python setup.py install" line
-  if [[ "$BUILD_ENVIRONMENT" != *ppc64le*  && "$BUILD_ENVIRONMENT" != *clang* ]]; then
-    WERROR=1 python setup.py install
-  else
-    python setup.py install
-  fi
-
-  # TODO: I'm not sure why, but somehow we lose verbose commands
-  set -x
-
-  if which sccache > /dev/null; then
-    echo 'PyTorch Build Statistics'
-    sccache --show-stats
-  fi
-
-  assert_git_not_dirty
-
-  # Test documentation build
-  if [[ "$BUILD_ENVIRONMENT" == *xenial-cuda9-cudnn7-py3* ]]; then
-    pushd docs
-    # TODO: Don't run this here
-    pip_install -r requirements.txt || true
-    LC_ALL=C make html
-    popd
-    assert_git_not_dirty
-  fi
-
-  # Build custom operator tests.
-  CUSTOM_OP_BUILD="$PWD/../custom-op-build"
-  CUSTOM_OP_TEST="$PWD/test/custom_operator"
-  python --version
-  SITE_PACKAGES="$(python -c 'from distutils.sysconfig import get_python_lib; print(get_python_lib())')"
-  mkdir "$CUSTOM_OP_BUILD"
-  pushd "$CUSTOM_OP_BUILD"
-  cmake "$CUSTOM_OP_TEST" -DCMAKE_PREFIX_PATH="$SITE_PACKAGES/torch" -DPYTHON_EXECUTABLE="$(which python)"
-  make VERBOSE=1
-  popd
-  assert_git_not_dirty
+  tools/bazel build :torch
 else
-  # Test standalone c10 build
-  if [[ "$BUILD_ENVIRONMENT" == *xenial-cuda9-cudnn7-py3* ]]; then
-    mkdir -p c10/build
-    pushd c10/build
-    cmake ..
-    make -j
+  # check that setup.py would fail with bad arguments
+  echo "The next three invocations are expected to fail with invalid command error messages."
+  ( ! get_exit_code python setup.py bad_argument )
+  ( ! get_exit_code python setup.py clean] )
+  ( ! get_exit_code python setup.py clean bad_argument )
+
+  if [[ "$BUILD_ENVIRONMENT" != *libtorch* ]]; then
+
+    # ppc64le build fails when WERROR=1
+    # set only when building other architectures
+    # only use for "python setup.py install" line
+    if [[ "$BUILD_ENVIRONMENT" != *ppc64le*  && "$BUILD_ENVIRONMENT" != *clang* ]]; then
+      WERROR=1 python setup.py bdist_wheel
+      python -mpip install dist/*.whl
+    else
+      python setup.py bdist_wheel
+      python -mpip install dist/*.whl
+    fi
+
+    # TODO: I'm not sure why, but somehow we lose verbose commands
+    set -x
+
+    if which sccache > /dev/null; then
+      echo 'PyTorch Build Statistics'
+      sccache --show-stats
+    fi
+
+    assert_git_not_dirty
+    # Copy ninja build logs to dist folder
+    mkdir -p dist
+    if [ -f build/.ninja_log ]; then
+      cp build/.ninja_log dist
+    fi
+
+    # Build custom operator tests.
+    CUSTOM_OP_BUILD="$PWD/../custom-op-build"
+    CUSTOM_OP_TEST="$PWD/test/custom_operator"
+    python --version
+    SITE_PACKAGES="$(python -c 'from distutils.sysconfig import get_python_lib; print(get_python_lib())')"
+    mkdir "$CUSTOM_OP_BUILD"
+    pushd "$CUSTOM_OP_BUILD"
+    cmake "$CUSTOM_OP_TEST" -DCMAKE_PREFIX_PATH="$SITE_PACKAGES/torch" -DPYTHON_EXECUTABLE="$(which python)"
+    make VERBOSE=1
     popd
     assert_git_not_dirty
-  fi
 
-  # Test no-Python build
-  echo "Building libtorch"
-  # NB: Install outside of source directory (at the same level as the root
-  # pytorch folder) so that it doesn't get cleaned away prior to docker push.
-  BUILD_LIBTORCH_PY=$PWD/tools/build_libtorch.py
-  mkdir -p ../cpp-build/caffe2
-  pushd ../cpp-build/caffe2
-  WERROR=1 VERBOSE=1 DEBUG=1 python $BUILD_LIBTORCH_PY
-  popd
+    # Build custom backend tests.
+    CUSTOM_BACKEND_BUILD="$PWD/../custom-backend-build"
+    CUSTOM_BACKEND_TEST="$PWD/test/custom_backend"
+    python --version
+    mkdir "$CUSTOM_BACKEND_BUILD"
+    pushd "$CUSTOM_BACKEND_BUILD"
+    cmake "$CUSTOM_BACKEND_TEST" -DCMAKE_PREFIX_PATH="$SITE_PACKAGES/torch" -DPYTHON_EXECUTABLE="$(which python)"
+    make VERBOSE=1
+    popd
+    assert_git_not_dirty
+  else
+    # Test standalone c10 build
+    if [[ "$BUILD_ENVIRONMENT" == *xenial-cuda10.1-cudnn7-py3* ]]; then
+      mkdir -p c10/build
+      pushd c10/build
+      cmake ..
+      make -j
+      popd
+      assert_git_not_dirty
+    fi
+
+    # Test no-Python build
+    echo "Building libtorch"
+    # NB: Install outside of source directory (at the same level as the root
+    # pytorch folder) so that it doesn't get cleaned away prior to docker push.
+    BUILD_LIBTORCH_PY=$PWD/tools/build_libtorch.py
+    mkdir -p ../cpp-build/caffe2
+    pushd ../cpp-build/caffe2
+    WERROR=1 VERBOSE=1 DEBUG=1 python $BUILD_LIBTORCH_PY
+    popd
+  fi
 fi
 
 # Test XLA build
@@ -227,31 +293,15 @@ if [[ "${BUILD_ENVIRONMENT}" == *xla* ]]; then
 
   pip_install lark-parser
 
-  # Bazel doesn't work with sccache gcc. https://github.com/bazelbuild/bazel/issues/3642
-  sudo add-apt-repository "deb http://apt.llvm.org/xenial/ llvm-toolchain-xenial-7 main"
-  wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key|sudo apt-key add -
   sudo apt-get -qq update
+  sudo apt-get -qq install npm nodejs
 
-  # Install clang-7 clang++-7 for xla
-  sudo apt-get -qq install clang-7 clang++-7
-
-  # Bazel dependencies
-  sudo apt-get -qq install pkg-config zip zlib1g-dev unzip
   # XLA build requires Bazel
-  wget https://github.com/bazelbuild/bazel/releases/download/0.24.1/bazel-0.24.1-installer-linux-x86_64.sh
-  chmod +x bazel-*.sh
-  sudo ./bazel-*.sh
-  BAZEL="$(which bazel)"
-  if [ -z "${BAZEL}" ]; then
-    echo "Unable to find bazel..."
-    exit 1
-  fi
+  # We use bazelisk to avoid updating Bazel version manually.
+  sudo npm install -g @bazel/bazelisk
+  sudo ln -s "$(command -v bazelisk)" /usr/bin/bazel
 
   # Install bazels3cache for cloud cache
-  sudo apt-get -qq install npm
-  npm config set strict-ssl false
-  curl -sL https://deb.nodesource.com/setup_6.x | sudo -E bash -
-  sudo apt-get install -qq nodejs
   sudo npm install -g bazels3cache
   BAZELS3CACHE="$(which bazels3cache)"
   if [ -z "${BAZELS3CACHE}" ]; then
@@ -261,7 +311,7 @@ if [[ "${BUILD_ENVIRONMENT}" == *xla* ]]; then
 
   bazels3cache --bucket=${XLA_CLANG_CACHE_S3_BUCKET_NAME} --maxEntrySizeBytes=0
   pushd xla
-  export CC=clang-7 CXX=clang++-7
+  export CC=clang-9 CXX=clang++-9
   # Use cloud cache to build when available.
   sed -i '/bazel build/ a --remote_http_cache=http://localhost:7777 \\' build_torch_xla_libs.sh
 

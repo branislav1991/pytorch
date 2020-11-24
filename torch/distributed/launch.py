@@ -1,6 +1,3 @@
-from __future__ import absolute_import, division, print_function, unicode_literals
-
-
 r"""
 `torch.distributed.launch` is a module that spawns up multiple distributed
 training processes on each of the training nodes.
@@ -63,7 +60,7 @@ Node 2:
 
 **Important Notices:**
 
-1. This utilty and multi-process distributed (single-node or
+1. This utility and multi-process distributed (single-node or
 multi-node) GPU training currently only achieves the best performance using
 the NCCL distributed backend. Thus NCCL backend is the recommended backend to
 use for GPU training.
@@ -86,13 +83,13 @@ Set your device to local rank using either
 
 ::
 
-    >>> torch.cuda.set_device(arg.local_rank)  # before your code runs
+    >>> torch.cuda.set_device(args.local_rank)  # before your code runs
 
 or
 
 ::
 
-    >>> with torch.cuda.device(arg.local_rank):
+    >>> with torch.cuda.device(args.local_rank):
     >>>    # your code to run
 
 3. In your training program, you are supposed to call the following function
@@ -114,8 +111,8 @@ here is how to configure it.
 ::
 
     model = torch.nn.parallel.DistributedDataParallel(model,
-                                                      device_ids=[arg.local_rank],
-                                                      output_device=arg.local_rank)
+                                                      device_ids=[args.local_rank],
+                                                      output_device=args.local_rank)
 
 Please ensure that ``device_ids`` argument is set to be the only GPU device id
 that your code will be operating on. This is generally the local rank of the
@@ -144,7 +141,10 @@ import sys
 import subprocess
 import os
 from argparse import ArgumentParser, REMAINDER
+from typing import Optional, IO
 
+node_local_rank_stdout_filename = "node_{}_local_rank_{}_stdout"
+node_local_rank_stderr_filename = "node_{}_local_rank_{}_stderr"
 
 def parse_args():
     """
@@ -152,7 +152,7 @@ def parse_args():
     @retval ArgumentParser
     """
     parser = ArgumentParser(description="PyTorch distributed training launch "
-                                        "helper utilty that will spawn up "
+                                        "helper utility that will spawn up "
                                         "multiple distributed processes")
 
     # Optional arguments for the launch helper
@@ -174,7 +174,7 @@ def parse_args():
                              "--master_addr can simply be 127.0.0.1")
     parser.add_argument("--master_port", default=29500, type=int,
                         help="Master node (rank 0)'s free port that needs to "
-                             "be used for communciation during distributed "
+                             "be used for communication during distributed "
                              "training")
     parser.add_argument("--use_env", default=False, action="store_true",
                         help="Use environment variable to pass "
@@ -185,6 +185,19 @@ def parse_args():
                         help="Changes each process to interpret the launch script "
                              "as a python module, executing with the same behavior as"
                              "'python -m'.")
+    parser.add_argument("--no_python", default=False, action="store_true",
+                        help="Do not prepend the training script with \"python\" - just exec "
+                             "it directly. Useful when the script is not a Python script.")
+    parser.add_argument(
+        "--logdir",
+        default=None,
+        type=str,
+        help=f"""Relative path to write subprocess logs to. Passing in a relative
+        path will create a directory if needed, and write the stdout and stderr to files
+        {node_local_rank_stdout_filename} and {node_local_rank_stderr_filename}. Note that
+        successive runs with the  same path to write logs to will overwrite existing logs,
+        so be sure to save logs as needed.""",
+    )
 
     # positional
     parser.add_argument("training_script", type=str,
@@ -220,6 +233,17 @@ def main():
               "your application as needed. \n"
               "*****************************************".format(current_env["OMP_NUM_THREADS"]))
 
+    if args.logdir:
+        # Possibly create the directory to write subprocess log output to.
+        if os.path.exists(args.logdir):
+            if not os.path.isdir(args.logdir):
+                raise ValueError("argument --logdir must be a path to a directory.")
+        else:
+            # create the relative directory
+            os.mkdir(os.path.join(os.getcwd(), args.logdir))
+
+    subprocess_file_handles = []
+
     for local_rank in range(0, args.nproc_per_node):
         # each process's rank
         dist_rank = args.nproc_per_node * args.node_rank + local_rank
@@ -227,10 +251,17 @@ def main():
         current_env["LOCAL_RANK"] = str(local_rank)
 
         # spawn the processes
-        cmd = [sys.executable, "-u"]
-
-        if args.module:
-            cmd.append("-m")
+        with_python = not args.no_python
+        cmd = []
+        if with_python:
+            cmd = [sys.executable, "-u"]
+            if args.module:
+                cmd.append("-m")
+        else:
+            if not args.use_env:
+                raise ValueError("When using the '--no_python' flag, you must also set the '--use_env' flag.")
+            if args.module:
+                raise ValueError("Don't use both the '--no_python' flag and the '--module' flag at the same time.")
 
         cmd.append(args.training_script)
 
@@ -239,15 +270,37 @@ def main():
 
         cmd.extend(args.training_script_args)
 
-        process = subprocess.Popen(cmd, env=current_env)
+        stdout_handle: Optional[IO]
+        stderr_handle: Optional[IO]
+        if args.logdir:
+            directory_path = os.path.join(os.getcwd(), args.logdir)
+            node_rank = args.node_rank
+            stdout_file_name = node_local_rank_stdout_filename.format(node_rank, local_rank)
+            stderr_file_name = node_local_rank_stderr_filename.format(node_rank, local_rank)
+            stdout_handle = open(os.path.join(directory_path, stdout_file_name), "w")
+            stderr_handle = open(os.path.join(directory_path, stderr_file_name), "w")
+            subprocess_file_handles.append((stdout_handle, stderr_handle))
+            stdout_name = stdout_handle.name
+            stderr_name = stderr_handle.name
+            print(f"""Note: Stdout and stderr for node {node_rank} rank {local_rank} will
+            be written to {stdout_name}, {stderr_name} respectively.""")
+
+        stdout_handle = None if not subprocess_file_handles else subprocess_file_handles[local_rank][0]
+        stderr_handle = None if not subprocess_file_handles else subprocess_file_handles[local_rank][1]
+        process = subprocess.Popen(cmd, env=current_env, stdout=stdout_handle, stderr=stderr_handle)
         processes.append(process)
 
-    for process in processes:
-        process.wait()
-        if process.returncode != 0:
-            raise subprocess.CalledProcessError(returncode=process.returncode,
-                                                cmd=cmd)
-
+    try:
+        for process in processes:
+            process.wait()
+            if process.returncode != 0:
+                raise subprocess.CalledProcessError(returncode=process.returncode,
+                                                    cmd=cmd)
+    finally:
+        # close open file descriptors
+        for (stdout_handle, stderr_handle) in subprocess_file_handles:
+            stdout_handle.close()
+            stderr_handle.close()
 
 if __name__ == "__main__":
     main()

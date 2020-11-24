@@ -1,5 +1,7 @@
 #include <torch/csrc/jit/passes/utils/check_alias_annotation.h>
-#include <torch/csrc/jit/operator.h>
+#include <torch/csrc/jit/passes/constant_propagation.h>
+#include <torch/csrc/jit/passes/normalize_ops.h>
+#include <torch/csrc/jit/runtime/operator.h>
 
 namespace torch {
 namespace jit {
@@ -13,19 +15,19 @@ IValue deepCopy(const IValue& self) {
 
   // Tensors need special handling, since copy assignment creates an alias
   if (self.isTensor()) {
-    return IValue(self.toTensor().clone());
+    return IValue(self.toTensor().clone(at::MemoryFormat::Preserve));
   }
   if (self.isTensorList()) {
     c10::List<at::Tensor> newList;
-    for (const at::Tensor& oldTensor : self.toTensorListRef()) {
-      newList.push_back(oldTensor.clone());
+    for (const at::Tensor& oldTensor : self.toTensorVector()) {
+      newList.push_back(oldTensor.clone(at::MemoryFormat::Preserve));
     }
     return newList;
   }
 
   // Lists of ivalues should recursively deep copy their contents
-  if (self.isGenericList()) {
-    auto source = std::move(self).toGenericList();
+  if (self.isList()) {
+    auto source = std::move(self).toList();
     auto newList = c10::impl::GenericList(source.elementType());
     newList.reserve(source.size());
     for (const IValue& value : source) {
@@ -60,19 +62,11 @@ Stack deepCopy(const Stack& stack) {
 }
 
 bool deepEquals(const IValue& lhs, const IValue& rhs) {
-  if (lhs.isInt() && rhs.isInt()) {
-    return lhs.toInt() == rhs.toInt();
-  } else if (lhs.isDouble() && rhs.isDouble()) {
-    return lhs.toDouble() == rhs.toDouble();
-  } else if (lhs.isNone() && rhs.isNone()) {
-    return true;
-  } else if (lhs.isIntList() && rhs.isIntList()) {
-    return lhs.toIntListRef().equals(rhs.toIntListRef());
-  } else if (lhs.isTensor() && rhs.isTensor()) {
+  if (lhs.isTensor() && rhs.isTensor()) {
     return lhs.toTensor().equal(rhs.toTensor());
   }
 
-  throw std::runtime_error("Deep equals not implemented for type");
+  return lhs == rhs;
 }
 
 struct AliasAndIValue {
@@ -145,6 +139,16 @@ const Node* findNodeForOp(
       return node;
     }
   }
+
+  // Check for alias-ed operator names
+  const auto aliasOp = torch::jit::getOperatorAliasMap().find(opName);
+  AT_ASSERT(aliasOp != torch::jit::getOperatorAliasMap().end());
+  for (const auto node : g.nodes()) {
+    if (node->kind() == aliasOp->second) {
+      return node;
+    }
+  }
+
   AT_ASSERT(false);
 }
 
@@ -167,26 +171,22 @@ c10::optional<IValue> toIValueProp(const Value* v) {
     auto listType = v->node()->output()->type();
     auto containedType = listType->containedTypes().at(0);
     if (containedType == IntType::get()) {
-      return c10::impl::toList(fmap(genericList, [](const IValue& v) { return v.toInt(); }));
+      return IValue(
+          fmap(genericList, [](const IValue& v) { return v.toInt(); }));
     } else if (containedType == FloatType::get()) {
-      return c10::impl::toList(fmap(genericList, [](const IValue& v) { return v.toDouble(); }));
+      return IValue(
+          fmap(genericList, [](const IValue& v) { return v.toDouble(); }));
     } else if (containedType->isSubtypeOf(TensorType::get())) {
-      return c10::impl::toList(fmap(genericList, [](const IValue& v) { return v.toTensor(); }));
+      return IValue(
+          fmap(genericList, [](const IValue& v) { return v.toTensor(); }));
     } else {
       return c10::nullopt;
     }
   }
 
   if (v->node()->kind() == aten::Float) {
-    auto op = getOperation(v->node());
-    if (auto input = toIValue(v->node()->input())) {
-      auto op = getOperation(v->node());
-      Stack stack;
-      push(stack, *input);
-      op(stack);
-      return stack.back();
-    } else {
-      return c10::nullopt;
+    if (auto maybe_stack = runNodeIfInputsAreConstant(v->node())) {
+      return maybe_stack->at(0);
     }
   }
   return c10::nullopt;
@@ -239,7 +239,7 @@ void checkAliasAnnotation(
   const auto inputsDeepCopy = deepCopy(stack);
 
   // Run the op
-  getOperation(node)(stack);
+  node->getOperation()(&stack);
 
   const auto outputs = std::move(stack);
 

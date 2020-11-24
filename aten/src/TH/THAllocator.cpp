@@ -1,10 +1,5 @@
 #include <TH/THAllocator.h>
 
-/* stuff for mapped files */
-#ifdef _WIN32
-#include <windows.h>
-#endif
-
 #include <atomic>
 #if ATOMIC_INT_LOCK_FREE == 2
 #define TH_ATOMIC_IPC_REFCOUNT 1
@@ -12,7 +7,12 @@
 
 #include <c10/core/CPUAllocator.h>
 
-#if HAVE_MMAP
+/* stuff for mapped files */
+#ifdef _WIN32
+#include <c10/util/win32-headers.h>
+#endif
+
+#if defined(HAVE_MMAP)
 #include <sys/types.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -288,6 +288,7 @@ THMapAllocator::THMapAllocator(WithFd, const char *filename, int fd, int flags, 
 
     if (base_ptr_ == MAP_FAILED) {
       base_ptr_ = nullptr; /* let's be sure it is NULL */
+      AT_ERROR("unable to mmap ", size_, " bytes from file <", filename_, ">: ", strerror(errno), " (", errno, ")");
     }
 
     if (flags_ & TH_ALLOCATOR_MAPPED_KEEPFD) {
@@ -319,6 +320,7 @@ THMapAllocator::THMapAllocator(WithFd, const char *filename, int fd, int flags, 
     }
   }
 #endif
+  c10::reportMemoryUsageToProfiler(base_ptr_, size_, c10::Device(c10::DeviceType::CPU));
 }
 
 THMapAllocator::THMapAllocator(const char *filename, int flags, size_t size)
@@ -331,7 +333,7 @@ typedef struct{
   HANDLE handle;
   HANDLE wait;
 } ReleaseContext;
-static VOID CALLBACK WaitForReleaseHandle(PVOID lpParam, BOOLEAN TimerOrWaitFired)
+static void CALLBACK WaitForReleaseHandle(PVOID lpParam, BOOLEAN TimerOrWaitFired)
 {
   if (lpParam) {
     ReleaseContext *ctx = (ReleaseContext *)lpParam;
@@ -563,4 +565,9 @@ at::DataPtr THRefcountedMapAllocator::makeDataPtr(WithFd, const char *filename, 
 
 void* THRefcountedMapAllocator::data() const {
   return static_cast<void*>(static_cast<char*>(base_ptr_) + TH_ALLOC_ALIGNMENT);
+}
+
+THMapAllocator::~THMapAllocator() {
+  close();
+  c10::reportMemoryUsageToProfiler(base_ptr_, -size_, c10::Device(c10::DeviceType::CPU));
 }

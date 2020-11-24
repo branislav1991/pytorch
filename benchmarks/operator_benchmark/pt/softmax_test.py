@@ -1,8 +1,3 @@
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-from __future__ import unicode_literals
-
 
 import operator_benchmark as op_bench
 import torch
@@ -20,11 +15,11 @@ softmax_configs_short = op_bench.config_list(
         'N', 'C', 'H', 'W'
     ],
     attrs=[
+        [1, 3, 256, 256],
         [4, 3, 256, 256],
-        [8, 3, 512, 512],
     ],
     cross_product_configs={
-        'device': ['cpu'],
+        'device': ['cpu', 'cuda'],
     },
     tags=['short']
 )
@@ -32,10 +27,10 @@ softmax_configs_short = op_bench.config_list(
 
 softmax_configs_long = op_bench.cross_product_configs(
     N=[8, 16],
-    C=[3, 64],
-    H=[64, 128],
-    W=[64, 128],
-    device=['cpu'],
+    C=[3],
+    H=[256, 512],
+    W=[256, 512],
+    device=['cpu', 'cuda'],
     tags=['long']
 )
 
@@ -52,11 +47,13 @@ softmax_ops_list = op_bench.op_list(
 
 class SoftmaxBenchmark(op_bench.TorchBenchmarkBase):
     def init(self, N, C, H, W, device, op_func):
-        self.input_one = torch.rand(N, C, H, W, device=device)
+        self.inputs = {
+            "input": torch.rand(N, C, H, W, device=device)
+        }
         self.op_func = op_func()
 
-    def forward(self):
-        return self.op_func(self.input_one)
+    def forward(self, input):
+        return self.op_func(input)
 
 
 op_bench.generate_pt_tests_from_op_list(softmax_ops_list,

@@ -1,144 +1,12 @@
 #include <ATen/ATen.h>
 #include <ATen/NativeFunctions.h>
 #include <ATen/native/UpSample.h>
+#include <ATen/MetaFunctions.h>
 
 namespace at {
-namespace native {
-namespace {
+namespace meta {
 
-template <typename scalar_t>
-static void upsample_nearest1d_out_frame(
-    scalar_t* odata,
-    scalar_t* idata,
-    int64_t input_width,
-    int64_t output_width,
-    int64_t nbatch,
-    int64_t channels) {
-  const float scale = (float)input_width / (float)output_width;
-  channels = channels * nbatch;
-
-  // special case: just copy
-  if (input_width == output_width) {
-    for (int64_t w2 = 0; w2 < output_width; ++w2) {
-      const int64_t w1 = w2;
-      const scalar_t* pos1 = &idata[w1];
-      scalar_t* pos2 = &odata[w2];
-
-      for (int64_t c = 0; c < channels; ++c) {
-        pos2[0] = pos1[0];
-        pos1 += input_width;
-        pos2 += output_width;
-      }
-    }
-    return;
-  }
-
-  for (int64_t w2 = 0; w2 < output_width; ++w2) {
-    const scalar_t src_x =
-        nearest_neighbor_compute_source_index(scale, w2, input_width);
-    const int64_t w1 = src_x;
-    const scalar_t* pos1 = &idata[w1];
-    scalar_t* pos2 = &odata[w2];
-
-    for (int64_t c = 0; c < channels; ++c) {
-      pos2[0] = pos1[0];
-      pos1 += input_width;
-      pos2 += output_width;
-    }
-  }
-}
-
-template <typename scalar_t>
-static void upsample_nearest1d_backward_out_frame(
-    scalar_t* odata,
-    scalar_t* idata,
-    int64_t input_width,
-    int64_t output_width,
-    int64_t nbatch,
-    int64_t channels) {
-  const float scale = (float)input_width / (float)output_width;
-  channels = channels * nbatch;
-
-  // special case: same-size matching grids
-  if (input_width == output_width) {
-    for (int64_t w2 = 0; w2 < output_width; ++w2) {
-      const int64_t w1 = w2;
-      scalar_t* pos1 = &idata[w1];
-      const scalar_t* pos2 = &odata[w2];
-
-      for (int64_t c = 0; c < channels; ++c) {
-        pos1[0] += pos2[0];
-        pos1 += input_width;
-        pos2 += output_width;
-      }
-    }
-    return;
-  }
-
-  for (int64_t w2 = 0; w2 < output_width; ++w2) {
-    const int64_t w1 =
-        nearest_neighbor_compute_source_index(scale, w2, input_width);
-
-    scalar_t* pos1 = &idata[w1];
-    const scalar_t* pos2 = &odata[w2];
-
-    for (int64_t c = 0; c < channels; ++c) {
-      pos1[0] += pos2[0];
-      pos1 += input_width;
-      pos2 += output_width;
-    }
-  }
-}
-
-static void upsample_nearest1d_out_cpu_template(
-    Tensor& output,
-    const Tensor& input_,
-    IntArrayRef output_size) {
-  TORCH_CHECK(
-      output_size.size() == 1,
-      "It is expected output_size equals to 1, but got size ",
-      output_size.size());
-
-  int64_t output_width = output_size[0];
-
-  int64_t nbatch = input_.size(0);
-  int64_t channels = input_.size(1);
-  int64_t input_width = input_.size(2);
-
-  upsample_1d_shape_check(
-      input_,
-      Tensor(),
-      nbatch,
-      channels,
-      input_width,
-      output_width);
-
-  auto input = input_.contiguous();
-
-  output.resize_({nbatch, channels, output_width});
-  output.zero_();
-
-  AT_ASSERT(input_width > 0 && output_width > 0);
-
-  AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.scalar_type(), "upsample_nearest1d", [&] {
-    auto* idata = input.data_ptr<scalar_t>();
-    auto* odata = output.data_ptr<scalar_t>();
-
-    upsample_nearest1d_out_frame<scalar_t>(
-        odata,
-        idata,
-        input_width,
-        output_width,
-        nbatch,
-        channels);
-  });
-}
-
-static void upsample_nearest1d_backward_out_cpu_template(
-    Tensor& grad_input,
-    const Tensor& grad_output_,
-    IntArrayRef output_size,
-    IntArrayRef input_size) {
+static std::array<int64_t, 3> upsample_nearest1d_common_check(IntArrayRef input_size, IntArrayRef output_size) {
   TORCH_CHECK(
       output_size.size() == 1,
       "It is expected output_size equals to 1, but got size ",
@@ -155,46 +23,50 @@ static void upsample_nearest1d_backward_out_cpu_template(
   int64_t channels = input_size[1];
   int64_t input_width = input_size[2];
 
-  upsample_1d_shape_check(
-      Tensor(),
-      grad_output_,
-      nbatch,
-      channels,
+  TORCH_CHECK(
+      input_width > 0 && output_width > 0,
+      "Input and output sizes should be greater than 0, but got input (W: ",
       input_width,
-      output_width);
+      ") and output (W: ",
+      output_width,
+      ")");
 
-  auto grad_output = grad_output_.contiguous();
-
-  grad_input.resize_({nbatch, channels, input_width});
-  grad_input.zero_();
-
-  AT_DISPATCH_FLOATING_TYPES_AND_HALF(
-      grad_output.scalar_type(), "upsample_nearest1d_backward", [&] {
-        scalar_t* idata = grad_input.data_ptr<scalar_t>();
-        scalar_t* odata = grad_output.data_ptr<scalar_t>();
-
-        upsample_nearest1d_backward_out_frame<scalar_t>(
-            odata,
-            idata,
-            input_width,
-            output_width,
-            nbatch,
-            channels);
-      });
+  return {nbatch, channels, output_width};
 }
-} // namespace
+
+TensorMeta upsample_nearest1d(const Tensor& input, IntArrayRef output_size, c10::optional<double> scales) {
+  auto full_output_size = upsample_nearest1d_common_check(input.sizes(), output_size);
+
+  // Allow for empty batch size but not other dimensions
+  TORCH_CHECK(
+      (input.size(1) != 0 && input.size(2) != 0) && input.dim() == 3,
+      "Non-empty 3D data tensor expected but got a tensor with sizes ",
+      input.sizes());
+
+  return new_meta(input, full_output_size);
+}
+
+TensorMeta upsample_nearest1d_backward(const Tensor& grad_output, IntArrayRef output_size, IntArrayRef input_size, c10::optional<double> scales) {
+  auto full_output_size = upsample_nearest1d_common_check(input_size, output_size);
+
+  check_dim_size(grad_output, 3, 0, full_output_size[0]);
+  check_dim_size(grad_output, 3, 1, full_output_size[1]);
+  check_dim_size(grad_output, 3, 2, full_output_size[2]);
+
+  return new_meta(grad_output, input_size);
+}
+
+} // namespace meta
+
+
+namespace native {
 
 Tensor& upsample_nearest1d_out_cpu(
     Tensor& output,
     const Tensor& input,
-    IntArrayRef output_size) {
-  upsample_nearest1d_out_cpu_template(output, input, output_size);
-  return output;
-}
-
-Tensor upsample_nearest1d_cpu(const Tensor& input, IntArrayRef output_size) {
-  auto output = at::empty({0}, input.options());
-  upsample_nearest1d_out_cpu_template(output, input, output_size);
+    IntArrayRef output_size,
+    c10::optional<double> scales) {
+  upsample_nearest1d_kernel(kCPU, output, input, scales);
   return output;
 }
 
@@ -202,21 +74,40 @@ Tensor& upsample_nearest1d_backward_out_cpu(
     Tensor& grad_input,
     const Tensor& grad_output,
     IntArrayRef output_size,
-    IntArrayRef input_size) {
-  upsample_nearest1d_backward_out_cpu_template(
-      grad_input, grad_output, output_size, input_size);
+    IntArrayRef input_size,
+    c10::optional<double> scales) {
+  grad_input.zero_();
+  upsample_nearest1d_backward_kernel(kCPU, grad_input, grad_output, scales);
   return grad_input;
 }
 
-Tensor upsample_nearest1d_backward_cpu(
-    const Tensor& grad_output,
-    IntArrayRef output_size,
-    IntArrayRef input_size) {
-  auto grad_input = at::zeros(input_size, grad_output.options());
-  upsample_nearest1d_backward_out_cpu_template(
-      grad_input, grad_output, output_size, input_size);
-  return grad_input;
+using at::native::upsample::compute_output_size;
+using at::native::upsample::get_scale_value;
+
+// vec variants
+
+Tensor upsample_nearest1d(
+    const Tensor& input,
+    c10::optional<IntArrayRef> output_size,
+    c10::optional<ArrayRef<double>> scale_factors) {
+  auto osize = compute_output_size(input.sizes(), output_size, scale_factors);
+  auto scale_w = get_scale_value(scale_factors, 0);
+  return at::upsample_nearest1d(input, osize, scale_w);
 }
+
+Tensor upsample_nearest1d_backward(
+    const Tensor& grad_output,
+    c10::optional<IntArrayRef> output_size,
+    IntArrayRef input_size,
+    c10::optional<ArrayRef<double>> scale_factors) {
+  auto osize = compute_output_size(input_size, output_size, scale_factors);
+  auto scale_w = get_scale_value(scale_factors, 0);
+  return at::upsample_nearest1d_backward(grad_output, osize, input_size, scale_w);
+}
+
+DEFINE_DISPATCH(upsample_nearest1d_kernel);
+DEFINE_DISPATCH(upsample_nearest1d_backward_kernel);
 
 } // namespace native
+
 } // namespace at

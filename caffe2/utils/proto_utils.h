@@ -80,13 +80,15 @@ inline bool ReadProtoFromTextFile(const string filename, MessageLite* proto) {
 
 inline void WriteProtoToTextFile(
     const MessageLite& /*proto*/,
-    const char* /*filename*/) {
+    const char* /*filename*/,
+    bool throwIfError = true) {
   LOG(FATAL) << "If you are running lite version, you should not be "
                   << "calling any text-format protobuffers.";
 }
 inline void WriteProtoToTextFile(const MessageLite& proto,
-                                 const string& filename) {
-  return WriteProtoToTextFile(proto, filename.c_str());
+                                 const string& filename,
+                                 bool throwIfError = true) {
+  return WriteProtoToTextFile(proto, filename.c_str(), throwIfError);
 }
 
 inline bool ReadProtoFromFile(const char* filename, MessageLite* proto) {
@@ -115,9 +117,9 @@ inline bool ReadProtoFromTextFile(const string filename, Message* proto) {
   return ReadProtoFromTextFile(filename.c_str(), proto);
 }
 
-CAFFE2_API void WriteProtoToTextFile(const Message& proto, const char* filename);
-inline void WriteProtoToTextFile(const Message& proto, const string& filename) {
-  return WriteProtoToTextFile(proto, filename.c_str());
+CAFFE2_API void WriteProtoToTextFile(const Message& proto, const char* filename, bool throwIfError = true);
+inline void WriteProtoToTextFile(const Message& proto, const string& filename, bool throwIfError = true) {
+  return WriteProtoToTextFile(proto, filename.c_str(), throwIfError);
 }
 
 // Read Proto from a file, letting the code figure out if it is text or binary.
@@ -270,7 +272,7 @@ class C10_EXPORT ArgumentHelper {
     if (arg_map_.at(name).has_s()) {
       CAFFE_ENFORCE(
           message.ParseFromString(arg_map_.at(name).s()),
-          "Faild to parse content from the string");
+          "Failed to parse content from the string");
     } else {
       VLOG(1) << "Return empty message for parameter " << name;
     }
@@ -284,7 +286,7 @@ class C10_EXPORT ArgumentHelper {
     for (int i = 0; i < messages.size(); ++i) {
       CAFFE_ENFORCE(
           messages[i].ParseFromString(arg_map_.at(name).strings(i)),
-          "Faild to parse content from the string");
+          "Failed to parse content from the string");
     }
     return messages;
   }
@@ -299,6 +301,10 @@ class C10_EXPORT ArgumentHelper {
 // name. Throws if argument does not exist.
 CAFFE2_API const Argument& GetArgument(const OperatorDef& def, const string& name);
 CAFFE2_API const Argument& GetArgument(const NetDef& def, const string& name);
+// Helper methods to get an argument from OperatorDef or NetDef given argument
+// name. Returns nullptr if argument does not exist.
+CAFFE2_API const Argument* GetArgumentPtr(const OperatorDef& def, const string& name);
+CAFFE2_API const Argument* GetArgumentPtr(const NetDef& def, const string& name);
 
 // Helper methods to query a boolean argument flag from OperatorDef or NetDef
 // given argument name. If argument does not exist, return default value.
@@ -316,12 +322,16 @@ CAFFE2_API Argument* GetMutableArgument(
     const string& name,
     const bool create_if_missing,
     OperatorDef* def);
+CAFFE2_API Argument* GetMutableArgument(
+    const string& name,
+    const bool create_if_missing,
+    NetDef* def);
 
 template <typename T>
 CAFFE2_API Argument MakeArgument(const string& name, const T& value);
 
-template <typename T>
-inline void AddArgument(const string& name, const T& value, OperatorDef* def) {
+template <typename T, typename Def>
+inline void AddArgument(const string& name, const T& value, Def* def) {
   GetMutableArgument(name, true, def)->CopyFrom(MakeArgument(name, value));
 }
 // **** End Arguments Utils *****

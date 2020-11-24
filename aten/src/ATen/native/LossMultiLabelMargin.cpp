@@ -142,9 +142,9 @@ static void multilabel_margin_loss_forward_out_cpu_template(
   TORCH_CHECK(is_target.is_contiguous(), "is_target must be contiguous");
   is_target.zero_();
 
-  // special case ndims == 0: produce scalar output for scalar inputs
+  // special case target.dim() <= 1: produce scalar output for scalar inputs
   // even if reduction == Reduction::None
-  if (reduction != Reduction::None || ndims == 0) {
+  if (reduction != Reduction::None || target.dim() <= 1) {
     output.resize_({});
   } else {
     output.resize_({nframe});
@@ -335,10 +335,19 @@ Tensor multilabel_margin_loss_backward_cpu(
     const Tensor& target,
     int64_t reduction,
     const Tensor& is_target) {
-  auto grad_input = at::zeros_like(self);
+  auto grad_input = at::zeros_like(self, LEGACY_CONTIGUOUS_MEMORY_FORMAT);
   multilabel_margin_loss_backward_cpu_out(
       grad_input, grad_output, self, target, reduction, is_target);
   return grad_input;
+}
+
+Tensor & multilabel_margin_loss_out(Tensor & output, const Tensor & self, const Tensor & target, int64_t reduction) {
+  Tensor is_target = at::empty({0}, self.options());
+  return std::get<0>(at::multilabel_margin_loss_forward_out(output, is_target, self, target, reduction));
+}
+
+Tensor multilabel_margin_loss(const Tensor & self, const Tensor & target, int64_t reduction) {
+  return std::get<0>(at::multilabel_margin_loss_forward(self, target, reduction));
 }
 
 } // namespace native

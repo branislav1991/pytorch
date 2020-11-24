@@ -6,7 +6,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <THC/THCGeneral.h>
 #include <THC/THCNumerics.cuh>
-#include <THC/THCAtomics.cuh>  // for atomicAdd
+#include <THC/THCAtomics.cuh>  // for gpuAtomicAdd
 #include <c10/util/Exception.h>
 
 #include <algorithm>
@@ -123,10 +123,9 @@ void adaptiveaveragepool_loop(
         istrideD,
         istrideT, istrideH, istrideW,
         offsetZ);
-
+    TORCH_CUDA_KERNEL_LAUNCH_CHECK();
     totalZ -= 65535;
     offsetZ += 65535;
-    AT_CUDA_CHECK(cudaGetLastError());
   }
 }
 
@@ -217,10 +216,9 @@ void adaptiveaveragegradinput_loop(
         isizeT, isizeH, isizeW,
         osizeT, osizeH, osizeW,
         offsetZ);
-
+    TORCH_CUDA_KERNEL_LAUNCH_CHECK();
     totalZ -= 65535;
     offsetZ += 65535;
-    AT_CUDA_CHECK(cudaGetLastError());
   }
 }
 
@@ -287,7 +285,7 @@ __global__ void atomicadaptiveaveragegradinput(
       for (it = 0; it < kT; ++it) {
         for (ih = 0; ih < kH; ++ih) {
           for (iw = 0; iw < kW; ++iw) {
-            atomicAdd(&(ptr_gradInput[ih*isizeW + iw]), grad_delta);
+            gpuAtomicAdd(&(ptr_gradInput[ih*isizeW + iw]), grad_delta);
           }
         }
         ptr_gradInput += isizeH*isizeW; // next input frame
@@ -312,10 +310,9 @@ void atomicadaptiveaveragegradinput_loop(
         isizeT, isizeH, isizeW,
         osizeT, osizeH, osizeW,
         offsetZ);
-
+    TORCH_CUDA_KERNEL_LAUNCH_CHECK();
     totalZ -= 65535;
     offsetZ += 65535;
-    AT_CUDA_CHECK(cudaGetLastError());
   }
 }
 
@@ -388,7 +385,7 @@ void adaptive_avg_pool3d_out_cuda_template(
     totalZ = sizeB * sizeD * osizeT;
   }
 
-  AT_DISPATCH_FLOATING_TYPES_AND_HALF(
+  AT_DISPATCH_FLOATING_TYPES_AND2(kHalf, kBFloat16,
       input.scalar_type(), "adaptive_avg_pool3d_cuda", [&] {
         scalar_t* input_data = input.data_ptr<scalar_t>();
         scalar_t* output_data = output.data_ptr<scalar_t>();
@@ -453,7 +450,7 @@ void adaptive_avg_pool3d_backward_out_cuda_template(
   }
 
   if (atomic) {
-    AT_DISPATCH_FLOATING_TYPES_AND_HALF(
+    AT_DISPATCH_FLOATING_TYPES_AND2(kHalf, kBFloat16,
         input.scalar_type(), "adaptive_avg_pool3d_backward_cuda", [&] {
           scalar_t* gradInput_data = gradInput.data_ptr<scalar_t>();
           scalar_t* gradOutput_data = gradOutput.data_ptr<scalar_t>();
@@ -465,7 +462,7 @@ void adaptive_avg_pool3d_backward_out_cuda_template(
               osizeT, osizeH, osizeW);
         });
   } else {
-    AT_DISPATCH_FLOATING_TYPES_AND_HALF(
+    AT_DISPATCH_FLOATING_TYPES_AND2(kHalf, kBFloat16,
         input.scalar_type(), "adaptive_avg_pool3d_backward_cuda", [&] {
           scalar_t* gradInput_data = gradInput.data_ptr<scalar_t>();
           scalar_t* gradOutput_data = gradOutput.data_ptr<scalar_t>();
@@ -501,6 +498,9 @@ Tensor& adaptive_avg_pool3d_backward_out_cuda(
     Tensor& gradInput,
     const Tensor& gradOutput_,
     const Tensor& input) {
+  // See Note [Writing Nondeterministic Operations]
+  // Nondeterministic because of atomicAdd usage
+  globalContext().alertNotDeterministic("adaptive_avg_pool3d_backward_out_cuda");
   adaptive_avg_pool3d_backward_out_cuda_template(gradInput, gradOutput_, input);
   return gradInput;
 }
@@ -508,7 +508,10 @@ Tensor& adaptive_avg_pool3d_backward_out_cuda(
 Tensor adaptive_avg_pool3d_backward_cuda(
     const Tensor& gradOutput_,
     const Tensor& input) {
-  auto gradInput = at::zeros_like(input);
+  // See Note [Writing Nondeterministic Operations]
+  // Nondeterministic because of atomicAdd usage
+  globalContext().alertNotDeterministic("adaptive_avg_pool3d_backward_cuda");
+  auto gradInput = at::zeros_like(input, LEGACY_CONTIGUOUS_MEMORY_FORMAT);
   adaptive_avg_pool3d_backward_out_cuda_template(gradInput, gradOutput_, input);
   return gradInput;
 }

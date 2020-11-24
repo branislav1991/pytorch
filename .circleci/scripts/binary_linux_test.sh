@@ -5,15 +5,25 @@ cat >/home/circleci/project/ci_test_script.sh <<EOL
 # =================== The following code will be executed inside Docker container ===================
 set -eux -o pipefail
 
+python_nodot="\$(echo $DESIRED_PYTHON | tr -d m.u)"
+
 # Set up Python
 if [[ "$PACKAGE_TYPE" == conda ]]; then
   retry conda create -qyn testenv python="$DESIRED_PYTHON"
   source activate testenv >/dev/null
-elif [[ "$DESIRED_PYTHON" == 2.7mu ]]; then
-  export PATH="/opt/python/cp27-cp27mu/bin:\$PATH"
 elif [[ "$PACKAGE_TYPE" != libtorch ]]; then
-  python_nodot="\$(echo $DESIRED_PYTHON | tr -d m.u)"
-  export PATH="/opt/python/cp\$python_nodot-cp\${python_nodot}m/bin:\$PATH"
+  python_path="/opt/python/cp\$python_nodot-cp\${python_nodot}"
+  # Prior to Python 3.8 paths were suffixed with an 'm'
+  if [[ -d  "\${python_path}/bin" ]]; then
+    export PATH="\${python_path}/bin:\$PATH"
+  elif [[ -d "\${python_path}m/bin" ]]; then
+    export PATH="\${python_path}m/bin:\$PATH"
+  fi
+fi
+
+EXTRA_CONDA_FLAGS=""
+if [[ "\$python_nodot" = *39* ]]; then
+  EXTRA_CONDA_FLAGS="-c=conda-forge"
 fi
 
 # Install the package
@@ -24,19 +34,19 @@ fi
 #   conda build scripts themselves. These should really be consolidated
 pkg="/final_pkgs/\$(ls /final_pkgs)"
 if [[ "$PACKAGE_TYPE" == conda ]]; then
-  conda install -y "\$pkg" --offline
+  conda install \${EXTRA_CONDA_FLAGS} -y "\$pkg" --offline
   if [[ "$DESIRED_CUDA" == 'cpu' ]]; then
-    conda install -y cpuonly -c pytorch
+    retry conda install \${EXTRA_CONDA_FLAGS} -y cpuonly -c pytorch
   fi
-  retry conda install -yq future numpy protobuf six
+  retry conda install \${EXTRA_CONDA_FLAGS} -yq future numpy protobuf six
   if [[ "$DESIRED_CUDA" != 'cpu' ]]; then
-    # DESIRED_CUDA is in format cu90 or cu100
+    # DESIRED_CUDA is in format cu90 or cu102
     if [[ "${#DESIRED_CUDA}" == 4 ]]; then
       cu_ver="${DESIRED_CUDA:2:1}.${DESIRED_CUDA:3}"
     else
       cu_ver="${DESIRED_CUDA:2:2}.${DESIRED_CUDA:4}"
     fi
-    retry conda install -yq -c pytorch "cudatoolkit=\${cu_ver}"
+    retry conda install \${EXTRA_CONDA_FLAGS} -yq -c nvidia -c pytorch "cudatoolkit=\${cu_ver}"
   fi
 elif [[ "$PACKAGE_TYPE" != libtorch ]]; then
   pip install "\$pkg"
@@ -50,6 +60,7 @@ fi
 
 # Test the package
 /builder/check_binary.sh
+
 # =================== The above code will be executed inside Docker container ===================
 EOL
 echo

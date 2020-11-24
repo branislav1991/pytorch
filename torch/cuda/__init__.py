@@ -9,106 +9,51 @@ It is lazily initialized, so you can always import it, and use
 """
 
 import contextlib
-import platform
-import ctypes
 import os
-import sys
 import torch
 import traceback
 import warnings
 import threading
-from torch._six import raise_from
-from subprocess import Popen, PIPE
-from multiprocessing.util import register_after_fork as _register_after_fork
-from ._utils import _get_device_index
+from typing import List, Optional, Tuple, Union
+from ._utils import _get_device_index, _dummy_type
+from .streams import Stream, Event
+from .. import device as _device
+import torch._C
+
+try:
+    from torch._C import _cudart  # type: ignore
+except ImportError:
+    _cudart = None
 
 _initialized = False
 _tls = threading.local()
 _initialization_lock = threading.Lock()
 _queued_calls = []  # don't invoke these until initialization occurs
-_in_bad_fork = False  # this global is also used in torch.manual_seed
-_original_pid = False
-_cudart = None
+_is_in_bad_fork = getattr(torch._C, "_cuda_isInBadFork", lambda: False)
+_device_t = Union[_device, str, int, None]
 
+# Define dummy _CudaDeviceProperties type if PyTorch was compiled without CUDA
+if hasattr(torch._C, '_CudaDeviceProperties'):
+    _CudaDeviceProperties = torch._C._CudaDeviceProperties
+else:
+    _CudaDeviceProperties = _dummy_type('_CudaDeviceProperties')  # type: ignore
 
-def find_cuda_windows_lib():
-    # Override the default search process
-    # Fixes https://github.com/pytorch/pytorch/issues/20202
-    # The libary selection will be done in these directories one by one
-    # 1. [Package Root]\Lib
-    #    That's where our libraries are in, which should be loaded first.
-    # 2. [Python Root]\Library\bin
-    #    That's where `cudatoolkit` store the cuda libraries.
-    # 3. Default directories
-    #    That is stored in the environment variable `PATH`.
-    test_env = os.environ.copy()
-    old_path = test_env['PATH']
-    py_dll_path = os.path.join(sys.exec_prefix, 'Library', 'bin')
-    th_dll_path = os.path.join(os.path.dirname(
-        os.path.dirname(__file__)), 'lib')
-    test_env['PATH'] = ';'.join([th_dll_path, py_dll_path, old_path])
-    proc = Popen(['where', 'cudart64*.dll'], stdout=PIPE,
-                 stderr=PIPE, stdin=PIPE, env=test_env)
-    out, err = proc.communicate()
-    out = out.decode().strip()
-    if len(out) > 0:
-        if out.find('\r\n') != -1:
-            out = out.split('\r\n')[0]
-        cuda_lib_name = os.path.basename(out)
-        cuda_lib = os.path.splitext(cuda_lib_name)[0]
-        cuda_lib = str(cuda_lib)
-        return ctypes.cdll.LoadLibrary(cuda_lib)
-    else:
-        return None
+# Global variables dynamically populated by native code
+has_magma: bool = False
+has_half: bool = False
+default_generators: Tuple[torch._C.Generator] = ()  # type: ignore[assignment]
 
-
-def is_available():
+def is_available() -> bool:
     r"""Returns a bool indicating if CUDA is currently available."""
-    if (not hasattr(torch._C, '_cuda_isDriverSufficient') or
-            not torch._C._cuda_isDriverSufficient()):
+    if not hasattr(torch._C, '_cuda_getDeviceCount'):
         return False
+    # This function never throws and returns 0 if driver is missing or can't
+    # be initialized
     return torch._C._cuda_getDeviceCount() > 0
 
 
 def _sleep(cycles):
     torch._C._cuda_sleep(cycles)
-
-
-def _load_cudart():
-    # First check the main program for CUDA symbols
-    if platform.system() == 'Windows':
-        lib = find_cuda_windows_lib()
-    else:
-        lib = ctypes.cdll.LoadLibrary(None)
-    if hasattr(lib, 'cudaGetErrorName'):
-        return lib
-
-    raise RuntimeError(
-        "couldn't find libcudart. Make sure CUDA libraries are installed in a "
-        "default location, or that they're in {}."
-        .format('DYLD_LIBRARY_PATH' if platform.system() == 'Darwin' else
-                'LD_LIBRARY_PATH'))
-
-
-def _check_driver():
-    if not hasattr(torch._C, '_cuda_isDriverSufficient'):
-        raise AssertionError("Torch not compiled with CUDA enabled")
-    if not torch._C._cuda_isDriverSufficient():
-        if torch._C._cuda_getDriverVersion() == 0:
-            # found no NVIDIA driver on the system
-            raise AssertionError("""
-Found no NVIDIA driver on your system. Please check that you
-have an NVIDIA GPU and installed a driver from
-http://www.nvidia.com/Download/index.aspx""")
-        else:
-            # TODO: directly link to the alternative bin that needs install
-            raise AssertionError("""
-The NVIDIA driver on your system is too old (found version {}).
-Please update your GPU driver by downloading and installing a new
-version from the URL: http://www.nvidia.com/Download/index.aspx
-Alternatively, go to: https://pytorch.org to install
-a PyTorch version that has been compiled with your version
-of the CUDA driver.""".format(str(torch._C._cuda_getDriverVersion())))
 
 
 def _check_capability():
@@ -125,42 +70,65 @@ def _check_capability():
     The minimum cuda capability that we support is 3.5.
     """
 
-    CUDA_VERSION = torch._C._cuda_getCompiledVersion()
-    for d in range(device_count()):
-        capability = get_device_capability(d)
-        major = capability[0]
-        minor = capability[1]
-        name = get_device_name(d)
-        if capability == (3, 0) or major < 3:
-            warnings.warn(old_gpu_warn % (d, name, major, capability[1]))
-        elif CUDA_VERSION <= 9000 and major >= 7 and minor >= 5:
-            warnings.warn(incorrect_binary_warn % (d, name, 10000, CUDA_VERSION))
+    if torch.version.cuda is not None:  # on ROCm we don't want this check
+        CUDA_VERSION = torch._C._cuda_getCompiledVersion()
+        for d in range(device_count()):
+            capability = get_device_capability(d)
+            major = capability[0]
+            minor = capability[1]
+            name = get_device_name(d)
+            if capability == (3, 0) or major < 3:
+                warnings.warn(old_gpu_warn % (d, name, major, capability[1]))
+            elif CUDA_VERSION <= 9000 and major >= 7 and minor >= 5:
+                warnings.warn(incorrect_binary_warn % (d, name, 10000, CUDA_VERSION))
+
+def _check_cubins():
+    incompatible_device_warn = """
+{} with CUDA capability sm_{} is not compatible with the current PyTorch installation.
+The current PyTorch install supports CUDA capabilities {}.
+If you want to use the {} GPU with PyTorch, please check the instructions at https://pytorch.org/get-started/locally/
+"""
+    if torch.version.cuda is None:  # on ROCm we don't want this check
+        return
+    arch_list = get_arch_list()
+    if len(arch_list) == 0:
+        return
+    supported_sm = [int(arch.split('_')[1]) for arch in arch_list if 'sm_' in arch]
+    for idx in range(device_count()):
+        cap_major, cap_minor = get_device_capability(idx)
+        # NVIDIA GPU compute architectures are backward compatible within major version
+        supported = any([sm // 10 == cap_major for sm in supported_sm])
+        if not supported:
+            device_name = get_device_name(idx)
+            capability = cap_major * 10 + cap_minor
+            warnings.warn(incompatible_device_warn.format(device_name, capability, " ".join(arch_list), device_name))
+
+
+def is_initialized():
+    r"""Returns whether PyTorch's CUDA state has been initialized."""
+    return _initialized and not _is_in_bad_fork()
 
 
 def _lazy_call(callable):
-    if _initialized:
+    if is_initialized():
         callable()
     else:
         # Don't store the actual traceback to avoid memory cycle
         _queued_calls.append((callable, traceback.format_stack()))
 
 _lazy_call(_check_capability)
+_lazy_call(_check_cubins)
 
 
 class DeferredCudaCallError(Exception):
     pass
 
 
-def is_initialized():
-    r"""Returns whether PyTorch's CUDA state has been initialized."""
-    return _initialized
-
-
 def init():
     r"""Initialize PyTorch's CUDA state.  You may need to call
     this explicitly if you are interacting with PyTorch via
     its C API, as Python bindings for CUDA functionality will not
-    be until this initialization takes place.  Ordinary users
+    be available until this initialization takes place.  Ordinary users
     should not need this, as all of PyTorch's CUDA methods
     automatically initialize CUDA state on-demand.
 
@@ -170,8 +138,8 @@ def init():
 
 
 def _lazy_init():
-    global _initialized, _cudart, _original_pid, _queued_calls
-    if _initialized or hasattr(_tls, 'is_initializing'):
+    global _initialized, _queued_calls
+    if is_initialized() or hasattr(_tls, 'is_initializing'):
         return
     with _initialization_lock:
         # We be double-checked locking, boys!  This is OK because
@@ -179,12 +147,12 @@ def _lazy_init():
         # is for when a thread blocked on some other thread which was
         # doing the initialization; when they get the lock, they will
         # find there is nothing left to do.
-        if _initialized:
+        if is_initialized():
             return
         # It is important to prevent other threads from entering _lazy_init
         # immediately, while we are still guaranteed to have the GIL, because some
         # of the C calls we make below will release the GIL
-        if _in_bad_fork:
+        if _is_in_bad_fork():
             from sys import version_info
             if version_info < (3, 4):
                 msg = ("To use CUDA with multiprocessing, you must use Python "
@@ -194,12 +162,14 @@ def _lazy_init():
                        "'spawn' start method")
             raise RuntimeError(
                 "Cannot re-initialize CUDA in forked subprocess. " + msg)
-        _check_driver()
+        if not hasattr(torch._C, '_cuda_getDeviceCount'):
+            raise AssertionError("Torch not compiled with CUDA enabled")
+        if _cudart is None:
+            raise AssertionError(
+                "libcudart functions unavailable. It looks like you have a broken build?")
+        # This function throws if there's a driver initialization error, no GPUs
+        # are found or any other error occurs
         torch._C._cuda_init()
-        _cudart = _load_cudart()
-        _cudart.cudaGetErrorName.restype = ctypes.c_char_p
-        _cudart.cudaGetErrorString.restype = ctypes.c_char_p
-        _original_pid = os.getpid()
         # Some of the queued calls may reentrantly call _lazy_init();
         # we need to just return without initializing in that case.
         # However, we must not let any *other* threads in!
@@ -209,23 +179,12 @@ def _lazy_init():
                 try:
                     queued_call()
                 except Exception as e:
-                    msg = ("CUDA call failed lazily at initialization with error: {}\n\n"
-                           "CUDA call was originally invoked at:\n\n{}").format(str(e), orig_traceback)
-                    raise_from(DeferredCudaCallError(msg), e)
+                    msg = (f"CUDA call failed lazily at initialization with error: {str(e)}\n\n"
+                           f"CUDA call was originally invoked at:\n\n{orig_traceback}")
+                    raise DeferredCudaCallError(msg) from e
         finally:
             delattr(_tls, 'is_initializing')
         _initialized = True
-
-
-def _after_fork(arg):
-    global _initialized, _in_bad_fork
-    if _initialized and _original_pid != os.getpid():
-        _initialized = False
-        _in_bad_fork = True
-        _CudaBase.__new__ = _lazy_new
-        torch._C._cuda_set_run_yet_variable_to_false()
-
-_register_after_fork(_after_fork, _after_fork)
 
 
 def cudart():
@@ -234,18 +193,17 @@ def cudart():
 
 
 class cudaStatus(object):
-    SUCCESS = 0
-    ERROR_NOT_READY = 34
-
+    SUCCESS: int = 0
+    ERROR_NOT_READY: int = 34
 
 class CudaError(RuntimeError):
-    def __init__(self, code):
-        msg = cudart().cudaGetErrorString(code).decode('utf-8')
+    def __init__(self, code: int) -> None:
+        msg = _cudart.cudaGetErrorString(_cudart.cudaError(code))
         super(CudaError, self).__init__('{0} ({1})'.format(msg, code))
 
 
-def check_error(res):
-    if res != cudaStatus.SUCCESS:
+def check_error(res: int) -> None:
+    if res != _cudart.cudaError.success:
         raise CudaError(res)
 
 
@@ -290,7 +248,7 @@ class device_of(device):
         super(device_of, self).__init__(idx)
 
 
-def set_device(device):
+def set_device(device: _device_t) -> None:
     r"""Sets the current device.
 
     Usage of this function is discouraged in favor of :any:`device`. In most
@@ -305,7 +263,7 @@ def set_device(device):
         torch._C._cuda_setDevice(device)
 
 
-def get_device_name(device=None):
+def get_device_name(device: Optional[_device_t] = None) -> str:
     r"""Gets the name of a device.
 
     Arguments:
@@ -317,7 +275,7 @@ def get_device_name(device=None):
     return get_device_properties(device).name
 
 
-def get_device_capability(device=None):
+def get_device_capability(device: Optional[_device_t] = None) -> Tuple[int, int]:
     r"""Gets the cuda capability of a device.
 
     Arguments:
@@ -334,13 +292,12 @@ def get_device_capability(device=None):
     return prop.major, prop.minor
 
 
-def get_device_properties(device):
-    if not _initialized:
-        init()  # will define _get_device_properties and _CudaDeviceProperties
+def get_device_properties(device: _device_t) -> _CudaDeviceProperties:
+    _lazy_init()  # will define _get_device_properties
     device = _get_device_index(device, optional=True)
     if device < 0 or device >= device_count():
         raise AssertionError("Invalid device id")
-    return _get_device_properties(device)
+    return _get_device_properties(device)  # type: ignore[name-defined]
 
 
 @contextlib.contextmanager
@@ -378,21 +335,39 @@ def stream(stream):
         torch._C._cuda_setStream(src_prev_stream._cdata)
 
 
-def device_count():
+def device_count() -> int:
     r"""Returns the number of GPUs available."""
     if is_available():
         return torch._C._cuda_getDeviceCount()
     else:
         return 0
 
+def get_arch_list() -> List[str]:
+    r"""Returns list CUDA architectures this library was compiled for."""
+    if not is_available():
+        return []
+    arch_flags = torch._C._cuda_getArchFlags()
+    if arch_flags is None:
+        return []
+    return arch_flags.split()
 
-def current_device():
+def get_gencode_flags() -> str:
+    r"""Returns NVCC gencode flags this library were compiled with."""
+    arch_list = get_arch_list()
+    if len(arch_list) == 0:
+        return ""
+    arch_list_ = [arch.split("_") for arch in arch_list]
+    return " ".join([f"-gencode compute=compute_{arch},code={kind}_{arch}" for (kind, arch) in arch_list_])
+
+
+
+def current_device() -> int:
     r"""Returns the index of a currently selected device."""
     _lazy_init()
     return torch._C._cuda_getDevice()
 
 
-def synchronize(device=None):
+def synchronize(device: _device_t = None) -> None:
     r"""Waits for all kernels in all streams on a CUDA device to complete.
 
     Arguments:
@@ -418,7 +393,7 @@ def ipc_collect():
     return torch._C._cuda_ipc_collect()
 
 
-def current_stream(device=None):
+def current_stream(device: Optional[_device_t] = None) -> Stream:
     r"""Returns the currently selected :class:`Stream` for a given device.
 
     Arguments:
@@ -428,11 +403,11 @@ def current_stream(device=None):
             (default).
     """
     _lazy_init()
-    return torch.cuda.Stream(_cdata=torch._C._cuda_getCurrentStream(
+    return Stream(_cdata=torch._C._cuda_getCurrentStream(
         _get_device_index(device, optional=True)))
 
 
-def default_stream(device=None):
+def default_stream(device: Optional[_device_t] = None) -> Stream:
     r"""Returns the default :class:`Stream` for a given device.
 
     Arguments:
@@ -442,7 +417,7 @@ def default_stream(device=None):
             (default).
     """
     _lazy_init()
-    return torch.cuda.Stream(_cdata=torch._C._cuda_getDefaultStream(
+    return Stream(_cdata=torch._C._cuda_getDefaultStream(
         _get_device_index(device, optional=True)))
 
 
@@ -465,17 +440,10 @@ from .random import *
 from ..storage import _StorageBase
 
 
-def _dummy_type(name):
-    def init_err(self):
-        class_name = self.__class__.__name__
-        raise RuntimeError(
-            "Tried to instantiate dummy base class {}".format(class_name))
-    return type(storage_name, (object,), {"__init__": init_err})
-
-
 if not hasattr(torch._C, 'CudaDoubleStorageBase'):
     # Define dummy base classes
-    for t in ['Double', 'Float', 'Long', 'Int', 'Short', 'Char', 'Byte', 'Half', 'Bool', 'BFloat16']:
+    for t in ['Double', 'Float', 'Long', 'Int', 'Short', 'Char', 'Byte', 'Half', 'Bool', 'BFloat16',
+              'ComplexDouble', 'ComplexFloat']:
         storage_name = 'Cuda{0}StorageBase'.format(t)
         tensor_name = 'Cuda{0}TensorBase'.format(t)
 
@@ -486,11 +454,11 @@ if not hasattr(torch._C, 'CudaDoubleStorageBase'):
     torch._C.__dict__['_CudaEventBase'] = _dummy_type('CudaEventBase')
 
 
-@staticmethod
+@staticmethod  # type: ignore[misc]
 def _lazy_new(cls, *args, **kwargs):
     _lazy_init()
-    # We need this method only for lazy init, so we can remove it
-    del _CudaBase.__new__
+    # We may need to call lazy init again if we are a forked child
+    # del _CudaBase.__new__
     return super(_CudaBase, cls).__new__(cls, *args, **kwargs)
 
 
@@ -499,8 +467,11 @@ class _CudaBase(object):
     is_sparse = False
 
     def type(self, *args, **kwargs):
-        with device(self.get_device()):
-            return super(_CudaBase, self).type(*args, **kwargs)
+        # We could use a Protocol here to tell mypy that self has `get_device` method
+        # but it is only available in the typing module on Python >= 3.8
+        # or on typing_extensions module on Python >= 3.6
+        with device(self.get_device()):  # type: ignore
+            return super(_CudaBase, self).type(*args, **kwargs)  # type: ignore[misc]
 
     __new__ = _lazy_new
 
@@ -544,6 +515,13 @@ class BoolStorage(_CudaBase, torch._C.CudaBoolStorageBase, _StorageBase):
 class BFloat16Storage(_CudaBase, torch._C.CudaBFloat16StorageBase, _StorageBase):
     pass
 
+class ComplexDoubleStorage(_CudaBase, torch._C.CudaComplexDoubleStorageBase, _StorageBase):
+    pass
+
+
+class ComplexFloatStorage(_CudaBase, torch._C.CudaComplexFloatStorageBase, _StorageBase):
+    pass
+
 torch._storage_classes.add(DoubleStorage)
 torch._storage_classes.add(FloatStorage)
 torch._storage_classes.add(LongStorage)
@@ -554,8 +532,10 @@ torch._storage_classes.add(ByteStorage)
 torch._storage_classes.add(HalfStorage)
 torch._storage_classes.add(BoolStorage)
 torch._storage_classes.add(BFloat16Storage)
+torch._storage_classes.add(ComplexDoubleStorage)
+torch._storage_classes.add(ComplexFloatStorage)
 
 from . import sparse
 from . import profiler
 from . import nvtx
-from .streams import Stream, Event
+from . import amp

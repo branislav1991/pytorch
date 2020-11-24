@@ -21,7 +21,7 @@ namespace caffe2 {
  *
  * pos = 0
  * fused_block_size = block_size + 8B // quantized values and scale and bias
- * for (i = 0..index_size-1)
+ * for (i = 0..output_size-1)
  *   for (k = 0..block_size-1)
  *     out[i*block_size + k] = 0
  *   start_offset = offsets[i]
@@ -50,7 +50,7 @@ void Fused8BitRowwiseEmbeddingLookupIdx(
     const std::int64_t data_size,
     const InType* input,
     const IndexType* indices,
-    const int64_t* offsets,
+    const IndexType* offsets,
     const float* weights, // optional, can be null for non-weighted sum
     bool normalize_by_lengths,
     OutType* out);

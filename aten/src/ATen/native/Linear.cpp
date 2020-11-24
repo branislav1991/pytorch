@@ -1,6 +1,8 @@
 #include <ATen/ATen.h>
 #include <ATen/NativeFunctions.h>
+#include <ATen/native/xnnpack/Engine.h>
 #include <ATen/WrapDimUtilsMulti.h>
+#include <c10/macros/Macros.h>
 
 #include <array>
 #include <cctype>
@@ -15,7 +17,11 @@ Tensor linear(const Tensor& input, const Tensor& weight, const Tensor& bias) {
   if (input.is_mkldnn()) {
     return at::mkldnn_linear(input, weight, bias);
   }
-
+#if defined(C10_MOBILE)
+  if (xnnpack::use_linear(input, weight, bias)) {
+    return xnnpack::linear(input, weight, bias);
+  }
+#endif
   if (input.dim() == 2 && bias.defined()) {
     // Fused op is marginally faster.
     return at::addmm(bias, input, weight.t());
@@ -151,7 +157,7 @@ Tensor einsum(std::string eqn, TensorList tensors) {
   // The internal representation of the left hand side fo the equation (with ellipsis expanded) is stored in input_op_idxes.
   // For each operand, we have a vector mapping each dimension to an internal index.
   // We also keep track of the number of occurrences for each letter (to infer a right hand side if not given) and
-  // of the last occurence of each index.
+  // of the last occurrence of each index.
   std::vector<std::vector<int64_t>> input_op_idxes;                   // the parsed operand indices
   std::array<std::int64_t, number_of_letters> num_letter_occurrences; // number of occurrence in the equation of this letter
   num_letter_occurrences.fill(0);
@@ -527,5 +533,11 @@ Tensor tensordot(const Tensor& input1, const Tensor& input2, IntArrayRef dims1, 
   // multiply and reshape to target size
   return at::mm(t1, t2).reshape(rsizes);
 }
+
+Tensor &tensordot_out(Tensor& result, const Tensor& input1, const Tensor& input2, IntArrayRef dims1, IntArrayRef dims2) {
+  result.copy_(at::native::tensordot(input1, input2, dims1, dims2));
+  return result;
+}
+
 
 }}  // namespace at::native

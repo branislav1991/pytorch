@@ -155,7 +155,9 @@ static void upsample_bilinear2d_out_cuda_template(
     Tensor& output,
     const Tensor& input,
     IntArrayRef output_size,
-    bool align_corners) {
+    bool align_corners,
+    c10::optional<double> scales_h,
+    c10::optional<double> scales_w) {
   TensorArg input_arg{input, "input", 1}, output_arg{output, "output", 2};
   checkAllSameGPU("upsample_bilinear2d_out_cuda", {input_arg, output_arg});
 
@@ -201,9 +203,9 @@ static void upsample_bilinear2d_out_cuda_template(
         auto odata = output.packed_accessor64<scalar_t, 4>();
 
         const accscalar_t rheight = area_pixel_compute_scale<accscalar_t>(
-            input_height, output_height, align_corners);
+            input_height, output_height, align_corners, scales_h);
         const accscalar_t rwidth = area_pixel_compute_scale<accscalar_t>(
-            input_width, output_width, align_corners);
+            input_width, output_width, align_corners, scales_w);
 
         upsample_bilinear2d_out_frame<scalar_t, accscalar_t>
             <<<cuda::ATenCeilDiv(num_kernels, num_threads),
@@ -211,9 +213,8 @@ static void upsample_bilinear2d_out_cuda_template(
                0,
                stream>>>(
                 num_kernels, rheight, rwidth, align_corners, idata, odata);
+        TORCH_CUDA_KERNEL_LAUNCH_CHECK();
       });
-
-  AT_CUDA_CHECK(cudaGetLastError());
 }
 
 static void upsample_bilinear2d_backward_out_cuda_template(
@@ -221,7 +222,9 @@ static void upsample_bilinear2d_backward_out_cuda_template(
     const Tensor& grad_output_,
     IntArrayRef output_size,
     IntArrayRef input_size,
-    bool align_corners) {
+    bool align_corners,
+    c10::optional<double> scales_h,
+    c10::optional<double> scales_w) {
   TensorArg grad_input_arg{grad_input, "grad_input", 1},
       grad_output_arg{grad_output_, "grad_output_", 2};
   checkAllSameGPU(
@@ -259,6 +262,10 @@ static void upsample_bilinear2d_backward_out_cuda_template(
   Tensor grad_output = grad_output_.contiguous();
 
   grad_input.resize_({nbatch, channels, input_height, input_width});
+  if (grad_input.numel() == 0) {
+    return;
+  }
+
   // A contiguous tensor is required for the kernel launch config
   grad_input.contiguous();
   // initialization to zero is required here. As we launch one thread per output
@@ -279,9 +286,9 @@ static void upsample_bilinear2d_backward_out_cuda_template(
         auto odata = grad_output.data_ptr<scalar_t>();
 
         const accscalar_t rheight = area_pixel_compute_scale<accscalar_t>(
-            input_height, output_height, align_corners);
+            input_height, output_height, align_corners, scales_h);
         const accscalar_t rwidth = area_pixel_compute_scale<accscalar_t>(
-            input_width, output_width, align_corners);
+            input_width, output_width, align_corners, scales_w);
 
         upsample_bilinear2d_backward_out_frame<scalar_t, accscalar_t>
             <<<cuda::ATenCeilDiv(num_kernels, static_cast<size_t>(num_threads)),
@@ -298,9 +305,8 @@ static void upsample_bilinear2d_backward_out_cuda_template(
                 align_corners,
                 idata,
                 odata);
+        TORCH_CUDA_KERNEL_LAUNCH_CHECK();
       });
-
-  AT_CUDA_CHECK(cudaGetLastError());
 }
 
 } // namespace
@@ -309,19 +315,23 @@ Tensor& upsample_bilinear2d_out_cuda(
     Tensor& output,
     const Tensor& input,
     IntArrayRef output_size,
-    bool align_corners) {
+    bool align_corners,
+    c10::optional<double> scales_h,
+    c10::optional<double> scales_w) {
   upsample_bilinear2d_out_cuda_template(
-      output, input, output_size, align_corners);
+      output, input, output_size, align_corners, scales_h, scales_w);
   return output;
 }
 
 Tensor upsample_bilinear2d_cuda(
     const Tensor& input,
     IntArrayRef output_size,
-    bool align_corners) {
-  Tensor output = at::empty_like(input);
+    bool align_corners,
+    c10::optional<double> scales_h,
+    c10::optional<double> scales_w) {
+  Tensor output = at::empty_like(input, LEGACY_CONTIGUOUS_MEMORY_FORMAT);
   upsample_bilinear2d_out_cuda_template(
-      output, input, output_size, align_corners);
+      output, input, output_size, align_corners, scales_h, scales_w);
   return output;
 }
 
@@ -330,9 +340,14 @@ Tensor& upsample_bilinear2d_backward_out_cuda(
     const Tensor& grad_output,
     IntArrayRef output_size,
     IntArrayRef input_size,
-    bool align_corners) {
+    bool align_corners,
+    c10::optional<double> scales_h,
+    c10::optional<double> scales_w) {
+  // See Note [Writing Nondeterministic Operations]
+  // Nondeterministic because of atomicAdd usage
+  globalContext().alertNotDeterministic("upsample_bilinear2d_backward_out_cuda");
   upsample_bilinear2d_backward_out_cuda_template(
-      grad_input, grad_output, output_size, input_size, align_corners);
+      grad_input, grad_output, output_size, input_size, align_corners, scales_h, scales_w);
   return grad_input;
 }
 
@@ -340,10 +355,48 @@ Tensor upsample_bilinear2d_backward_cuda(
     const Tensor& grad_output,
     IntArrayRef output_size,
     IntArrayRef input_size,
-    bool align_corners) {
-  Tensor grad_input = at::empty_like(grad_output);
+    bool align_corners,
+    c10::optional<double> scales_h,
+    c10::optional<double> scales_w) {
+  // See Note [Writing Nondeterministic Operations]
+  // Nondeterministic because of atomicAdd usage
+  globalContext().alertNotDeterministic("upsample_bilinear2d_backward_cuda");
+  Tensor grad_input = at::empty_like(grad_output, LEGACY_CONTIGUOUS_MEMORY_FORMAT);
   upsample_bilinear2d_backward_out_cuda_template(
-      grad_input, grad_output, output_size, input_size, align_corners);
+      grad_input, grad_output, output_size, input_size, align_corners, scales_h, scales_w);
+  return grad_input;
+}
+
+using at::native::upsample::compute_output_size;
+using at::native::upsample_cuda::get_scale_value;
+
+Tensor upsample_bilinear2d_cuda(
+    const Tensor& input,
+    c10::optional<IntArrayRef> output_size,
+    bool align_corners,
+    c10::optional<ArrayRef<double>> scale_factors) {
+  auto output = at::empty_like(input, LEGACY_CONTIGUOUS_MEMORY_FORMAT);
+  auto osize = compute_output_size(input.sizes(), output_size, scale_factors);
+  auto scale_h = get_scale_value(scale_factors, 0);
+  auto scale_w = get_scale_value(scale_factors, 1);
+  upsample_bilinear2d_out_cuda_template(output, input, osize, align_corners, scale_h, scale_w);
+  return output;
+}
+
+Tensor upsample_bilinear2d_backward_cuda(
+    const Tensor& grad_output,
+    c10::optional<IntArrayRef> output_size,
+    IntArrayRef input_size,
+    bool align_corners,
+    c10::optional<ArrayRef<double>> scale_factors) {
+  // Nondeterministic because of atomicAdd usage
+  globalContext().alertNotDeterministic("upsample_bilinear2d_backward_cuda");
+  auto osize = compute_output_size(input_size, output_size, scale_factors);
+  auto scale_h = get_scale_value(scale_factors, 0);
+  auto scale_w = get_scale_value(scale_factors, 1);
+  auto grad_input = at::empty_like(grad_output, LEGACY_CONTIGUOUS_MEMORY_FORMAT);
+  upsample_bilinear2d_backward_out_cuda_template(
+      grad_input, grad_output, osize, input_size, align_corners, scale_h, scale_w);
   return grad_input;
 }
 

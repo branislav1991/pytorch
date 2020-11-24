@@ -12,7 +12,7 @@ tree are also possible. In both cases, the script allows filtering files via
 glob or regular expressions.
 """
 
-from __future__ import print_function
+
 
 import argparse
 import collections
@@ -101,7 +101,7 @@ def filter_files(files, file_patterns):
                 yield file
                 continue
         if VERBOSE:
-            print("{} ommitted due to file filters".format(file))
+            print("{} omitted due to file filters".format(file))
 
 
 def get_changed_files(revision, paths):

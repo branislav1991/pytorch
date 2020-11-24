@@ -14,16 +14,16 @@ void UpsampleImpl::reset() {}
 
 void UpsampleImpl::pretty_print(std::ostream& stream) const {
   stream << "torch::nn::Upsample(";
-  if (!options.scale_factor().empty()) {
-    stream << "scale_factor=" << at::ArrayRef<double>(options.scale_factor());
+  if (options.scale_factor() != c10::nullopt) {
+    stream << "scale_factor=" << at::ArrayRef<double>(*options.scale_factor());
   } else {
-    stream << "size=" << at::ArrayRef<int64_t>(options.size());
+    stream << "size=" << at::ArrayRef<int64_t>(*options.size());
   }
   stream << ", mode=" << enumtype::get_enum_name(options.mode()) << ")";
 }
 
 Tensor UpsampleImpl::forward(const Tensor& input) {
-  InterpolateOptions::mode_t mode;
+  F::InterpolateFuncOptions::mode_t mode;
   if (c10::get_if<enumtype::kNearest>(&options.mode())) {
     mode = torch::kNearest;
   } else if (c10::get_if<enumtype::kLinear>(&options.mode())) {
@@ -36,13 +36,13 @@ Tensor UpsampleImpl::forward(const Tensor& input) {
     mode = torch::kTrilinear;
   }
 
-  return F::interpolate(
+  return F::detail::interpolate(
       input,
-      InterpolateOptions()
-          .size(options.size())
-          .scale_factor(options.scale_factor())
-          .mode(mode)
-          .align_corners(options.align_corners()));
+      options.size(),
+      options.scale_factor(),
+      mode,
+      options.align_corners(),
+      c10::nullopt);
 }
 
 } // namespace nn

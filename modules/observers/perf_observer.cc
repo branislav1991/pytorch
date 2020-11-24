@@ -18,6 +18,9 @@ defined(TARGET_IPHONE_SIMULATOR)
 #endif
 
 #ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 #endif
 
@@ -59,13 +62,13 @@ namespace {
 
 bool registerGlobalPerfNetObserverCreator(int* /*pargc*/, char*** /*pargv*/) {
   AddGlobalNetObserverCreator([](NetBase* subject) {
-    return caffe2::make_unique<PerfNetObserver>(subject);
+    return std::make_unique<PerfNetObserver>(subject);
   });
 
 #if !defined(C10_MOBILE)
   // for aibench usage
   caffe2::ObserverConfig::setReporter(
-      caffe2::make_unique<caffe2::NetObserverReporterPrint>());
+      std::make_unique<caffe2::NetObserverReporterPrint>());
 
   caffe2::ObserverConfig::initSampleRate(
       FLAGS_aiBench_netInitSampleRate,
@@ -208,7 +211,7 @@ void PerfNetObserver::Start() {
     const auto& operators = subject_->GetOperators();
     for (auto* op : operators) {
       observerMap_[op] = op->AttachObserver(
-          caffe2::make_unique<PerfOperatorObserver>(op, this));
+          std::make_unique<PerfOperatorObserver>(op, this));
     }
   }
 

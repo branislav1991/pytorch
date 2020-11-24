@@ -11,13 +11,12 @@ if(USE_CUDA)
 elseif(USE_ROCM)
   add_definitions(-DUSE_ROCM=1)
   add_definitions(-D__HIP_PLATFORM_HCC__=1)
-  add_definitions(-DHIP_VERSION=${HIP_VERSION_MAJOR})
 else()
   message(STATUS "Building c10d without CUDA/ROCm support")
 endif()
 
 if(USE_TBB)
-include_directories(${TBB_ROOT_DIR}/include)
+  include_directories(${TBB_ROOT_DIR}/include)
 endif()
 
 if(USE_GLOO)
@@ -49,9 +48,12 @@ set(C10D_SRCS
   ProcessGroup.cpp
   Store.cpp
   PrefixStore.cpp
-  TCPStore.cpp
   Utils.cpp
   )
+
+if(NOT WIN32)
+  list(APPEND C10D_SRCS HashStore.cpp ProcessGroupRoundRobin.cpp TCPStore.cpp)
+endif()
 
 set(C10D_LIBS torch)
 
@@ -66,7 +68,7 @@ if(USE_C10D_MPI)
 endif()
 
 if(USE_C10D_GLOO)
-  list(APPEND C10D_SRCS ProcessGroupGloo.cpp)
+  list(APPEND C10D_SRCS ProcessGroupGloo.cpp GlooDeviceFactory.cpp)
   list(APPEND C10D_LIBS gloo)
   if(USE_CUDA)
     list(APPEND C10D_LIBS gloo_cuda)
@@ -75,15 +77,18 @@ endif()
 
 add_library(c10d STATIC ${C10D_SRCS})
 set_property(TARGET c10d PROPERTY POSITION_INDEPENDENT_CODE ON)
-set_property(TARGET c10d PROPERTY CXX_STANDARD 11)
-target_compile_options(c10d PUBLIC
-  -Wall
-  -Wextra
-  -Wno-unused-parameter
-  -Wno-missing-field-initializers
-  -Wno-write-strings
-  -Wno-unknown-pragmas
-  )
+set_property(TARGET c10d PROPERTY CXX_STANDARD 14)
+
+if(NOT MSVC)
+  target_compile_options(c10d PUBLIC
+    -Wall
+    -Wextra
+    -Wno-unused-parameter
+    -Wno-missing-field-initializers
+    -Wno-write-strings
+    -Wno-unknown-pragmas
+    )
+endif()
 
 add_dependencies(c10d torch)
 
@@ -101,8 +106,6 @@ target_include_directories(c10d PUBLIC
 
 # For <c10d/...>
 target_include_directories(c10d PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
-# For torch/csrc/utils/hash.h
-target_include_directories(c10d PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../../..)
 
 if(USE_C10D_NCCL)
   target_compile_definitions(c10d INTERFACE USE_C10D_NCCL)
@@ -120,11 +123,15 @@ copy_header(FileStore.hpp)
 copy_header(PrefixStore.hpp)
 copy_header(ProcessGroup.hpp)
 copy_header(Store.hpp)
-copy_header(TCPStore.hpp)
 copy_header(Types.hpp)
 copy_header(Utils.hpp)
 if(USE_GLOO)
   copy_header(ProcessGroupGloo.hpp)
+  copy_header(GlooDeviceFactory.hpp)
+endif()
+if(NOT WIN32)
+  copy_header(HashStore.hpp)
+  copy_header(TCPStore.hpp)
 endif()
 
 if(USE_C10D_NCCL)

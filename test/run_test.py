@@ -1,9 +1,10 @@
 #!/usr/bin/env python
 
-from __future__ import print_function
-
 import argparse
+import copy
 from datetime import datetime
+import importlib
+import modulefinder
 import os
 import shutil
 import signal
@@ -14,102 +15,258 @@ import tempfile
 import torch
 import torch._six
 from torch.utils import cpp_extension
-from common_utils import TEST_WITH_ROCM, shell
+from torch.testing._internal.common_utils import TEST_WITH_ROCM, shell, FILE_SCHEMA
 import torch.distributed as dist
-PY33 = sys.version_info >= (3, 3)
-PY36 = sys.version_info >= (3, 6)
+from typing import Dict, Optional
 
 TESTS = [
-    'autograd',
-    'cpp_extensions',
-    'c10d',
-    'c10d_spawn',
-    'cuda',
-    'cuda_primary_ctx',
-    'dataloader',
-    'distributed',
-    'distributions',
-    'docs_coverage',
-    'expecttest',
-    'fake_quant',
-    'indexing',
-    'jit',
-    'logging',
-    'mkldnn',
-    'multiprocessing',
-    'multiprocessing_spawn',
-    'nccl',
-    'nn',
-    'numba_integration',
-    'optim',
-    'qat',
-    'quantization',
-    'quantized',
-    'quantized_tensor',
-    'quantized_nn_mods',
-    'sparse',
-    'torch',
-    'type_info',
-    'type_hints',
-    'utils',
-    'namedtuple_return_api',
-    'jit_fuser',
-    'tensorboard',
-    'namedtensor',
-    'type_promotion',
-    'jit_disabled',
-    'function_schema',
+    'test_autograd',
+    'benchmark_utils/test_benchmark_utils',
+    'test_bundled_inputs',
+    'test_complex',
+    'test_cpp_api_parity',
+    'test_cpp_extensions_aot_no_ninja',
+    'test_cpp_extensions_aot_ninja',
+    'test_cpp_extensions_jit',
+    'distributed/test_c10d',
+    'distributed/test_jit_c10d',
+    'distributed/test_c10d_spawn',
+    'test_cuda',
+    'test_jit_cuda_fuser',
+    'test_cuda_primary_ctx',
+    'test_dataloader',
+    'distributed/test_data_parallel',
+    'distributed/test_distributed_fork',
+    'distributed/test_distributed_spawn',
+    'distributions/test_constraints',
+    'distributions/test_distributions',
+    'test_expecttest',
+    'test_foreach',
+    'test_indexing',
+    'test_jit',
+    'test_linalg',
+    'test_logging',
+    'test_mkldnn',
+    'test_multiprocessing',
+    'test_multiprocessing_spawn',
+    'distributed/test_nccl',
+    'test_native_functions',
+    'test_numba_integration',
+    'test_nn',
+    'test_ops',
+    'test_optim',
+    'test_pytree',
+    'test_mobile_optimizer',
+    'test_xnnpack_integration',
+    'test_vulkan',
+    'test_sparse',
+    'test_quantization',
+    'test_spectral_ops',
+    'test_serialization',
+    'test_show_pickle',
+    'test_tensor_creation_ops',
+    'test_torch',
+    'test_type_info',
+    'test_type_hints',
+    'test_unary_ufuncs',
+    'test_utils',
+    'test_vmap',
+    'test_namedtuple_return_api',
+    'test_jit_profiling',
+    'test_jit_legacy',
+    'test_jit_fuser_legacy',
+    'test_tensorboard',
+    'test_namedtensor',
+    'test_type_promotion',
+    'test_jit_disabled',
+    'test_function_schema',
+    'test_op_aliases.py',
+    'test_overrides',
+    'test_jit_fuser_te',
+    'test_tensorexpr',
+    'test_openmp',
+    'test_profiler',
+    'distributed/nn/jit/test_instantiator',
+    'distributed/rpc/test_faulty_agent',
+    'distributed/rpc/test_process_group_agent',
+    'distributed/rpc/test_tensorpipe_agent',
+    'test_jit_py3',
+    'test_determination',
+    'test_futures',
+    'test_fx',
+    'test_fx_experimental',
+    'test_functional_autograd_benchmark',
+    'test_package',
+    'distributed/_pipeline/sync/skip/test_api',
+    'distributed/_pipeline/sync/skip/test_gpipe',
+    'distributed/_pipeline/sync/skip/test_inspect_skip_layout',
+    'distributed/_pipeline/sync/skip/test_leak',
+    'distributed/_pipeline/sync/skip/test_portal',
+    'distributed/_pipeline/sync/skip/test_stash_pop',
+    'distributed/_pipeline/sync/skip/test_tracker',
+    'distributed/_pipeline/sync/skip/test_verify_skippables',
+    'distributed/_pipeline/sync/test_balance',
+    'distributed/_pipeline/sync/test_bugs',
+    'distributed/_pipeline/sync/test_checkpoint',
+    'distributed/_pipeline/sync/test_copy',
+    'distributed/_pipeline/sync/test_deferred_batch_norm',
+    'distributed/_pipeline/sync/test_dependency',
+    'distributed/_pipeline/sync/test_inplace',
+    'distributed/_pipeline/sync/test_microbatch',
+    'distributed/_pipeline/sync/test_phony',
+    'distributed/_pipeline/sync/test_pipe',
+    'distributed/_pipeline/sync/test_pipeline',
+    'distributed/_pipeline/sync/test_stream',
+    'distributed/_pipeline/sync/test_transparency',
+    'distributed/_pipeline/sync/test_worker',
 ]
 
-# skip < 3.3 because mock is added in 3.3 and is used in rpc_fork and rpc_spawn
-# skip python2 for rpc and dist_autograd tests that do not support python2
-if PY33:
-    TESTS.extend([
-        'rpc_fork',
-        'rpc_spawn',
-        'dist_autograd_fork',
-        'dist_autograd_spawn',
-    ])
-
-# skip < 3.6 b/c fstrings added in 3.6
-if PY36:
-    TESTS.extend([
-        'jit_py3',
-    ])
-
-WINDOWS_BLACKLIST = [
-    'distributed',
-    'rpc_fork',
-    'rpc_spawn',
-    'dist_autograd_fork',
-    'dist_autograd_spawn',
+# Tests need to be run with pytest.
+USE_PYTEST_LIST = [
+    'distributed/_pipeline/sync/skip/test_api',
+    'distributed/_pipeline/sync/skip/test_gpipe',
+    'distributed/_pipeline/sync/skip/test_inspect_skip_layout',
+    'distributed/_pipeline/sync/skip/test_leak',
+    'distributed/_pipeline/sync/skip/test_portal',
+    'distributed/_pipeline/sync/skip/test_stash_pop',
+    'distributed/_pipeline/sync/skip/test_tracker',
+    'distributed/_pipeline/sync/skip/test_verify_skippables',
+    'distributed/_pipeline/sync/test_balance',
+    'distributed/_pipeline/sync/test_bugs',
+    'distributed/_pipeline/sync/test_checkpoint',
+    'distributed/_pipeline/sync/test_copy',
+    'distributed/_pipeline/sync/test_deferred_batch_norm',
+    'distributed/_pipeline/sync/test_dependency',
+    'distributed/_pipeline/sync/test_inplace',
+    'distributed/_pipeline/sync/test_microbatch',
+    'distributed/_pipeline/sync/test_phony',
+    'distributed/_pipeline/sync/test_pipe',
+    'distributed/_pipeline/sync/test_pipeline',
+    'distributed/_pipeline/sync/test_stream',
+    'distributed/_pipeline/sync/test_transparency',
+    'distributed/_pipeline/sync/test_worker',
 ]
 
-ROCM_BLACKLIST = [
-    'cpp_extensions',
-    'distributed',
-    'multiprocessing',
-    'rpc_fork',
-    'rpc_spawn',
-    'dist_autograd_fork',
-    'dist_autograd_spawn',
+WINDOWS_BLOCKLIST = [
+    'distributed/nn/jit/test_instantiator',
+    'distributed/rpc/test_faulty_agent',
+    'distributed/rpc/test_process_group_agent',
+    'distributed/rpc/test_tensorpipe_agent',
+    'distributed/test_distributed_fork',
 ]
+
+ROCM_BLOCKLIST = [
+    'distributed/nn/jit/test_instantiator',
+    'distributed/rpc/test_faulty_agent',
+    'distributed/rpc/test_process_group_agent',
+    'distributed/rpc/test_tensorpipe_agent',
+    'test_determination',
+    'test_multiprocessing',
+    'test_jit_legacy',
+    'test_type_hints',
+    'test_openmp',
+]
+
+RUN_PARALLEL_BLOCKLIST = [
+    'test_cpp_extensions_jit',
+    'test_expecttest',
+    'test_jit_disabled',
+    'test_mobile_optimizer',
+    'test_multiprocessing',
+    'test_multiprocessing_spawn',
+    'test_namedtuple_return_api',
+    'test_overrides',
+    'test_show_pickle',
+    'test_tensorexpr',
+    'test_cuda_primary_ctx',
+] + [test for test in TESTS if test.startswith('distributed/')]
+
+# These tests use some specific pytest feature like parameterized testing or
+# fixtures that cannot be run by unittest
+PYTEST_TESTS = [
+    'distributions/test_constraints'
+]
+
+# These tests are slow enough that it's worth calculating whether the patch
+# touched any related files first.
+SLOW_TESTS = [
+    'distributions/test_distributions',
+    'test_nn',
+    'test_autograd',
+    'test_cpp_extensions_jit',
+    'test_jit_legacy',
+    'test_dataloader',
+    'test_overrides',
+    'test_jit',
+    'test_jit_profiling',
+    'test_torch',
+    'distributed/nn/jit/test_instantiator',
+    'distributed/test_distributed_fork',
+    'distributed/rpc/test_process_group_agent',
+    'distributed/rpc/test_tensorpipe_agent',
+    'distributed/algorithms/ddp_comm_hooks/test_ddp_hooks',
+    'distributed/test_distributed_spawn',
+    'test_cuda',
+    'test_cuda_primary_ctx',
+    'test_cpp_extensions_aot_ninja',
+    'test_cpp_extensions_aot_no_ninja',
+    'test_serialization',
+    'test_optim',
+    'test_utils',
+    'test_multiprocessing',
+    'test_tensorboard',
+    'distributed/test_c10d',
+    'distributed/test_jit_c10d',
+    'distributed/test_c10d_spawn',
+    'test_quantization',
+    'test_determination',
+    'test_futures',
+    'distributed/_pipeline/sync/skip/test_api',
+    'distributed/_pipeline/sync/skip/test_gpipe',
+    'distributed/_pipeline/sync/skip/test_inspect_skip_layout',
+    'distributed/_pipeline/sync/skip/test_leak',
+    'distributed/_pipeline/sync/skip/test_portal',
+    'distributed/_pipeline/sync/skip/test_stash_pop',
+    'distributed/_pipeline/sync/skip/test_tracker',
+    'distributed/_pipeline/sync/skip/test_verify_skippables',
+    'distributed/_pipeline/sync/test_balance',
+    'distributed/_pipeline/sync/test_bugs',
+    'distributed/_pipeline/sync/test_checkpoint',
+    'distributed/_pipeline/sync/test_copy',
+    'distributed/_pipeline/sync/test_deferred_batch_norm',
+    'distributed/_pipeline/sync/test_dependency',
+    'distributed/_pipeline/sync/test_inplace',
+    'distributed/_pipeline/sync/test_microbatch',
+    'distributed/_pipeline/sync/test_phony',
+    'distributed/_pipeline/sync/test_pipe',
+    'distributed/_pipeline/sync/test_pipeline',
+    'distributed/_pipeline/sync/test_stream',
+    'distributed/_pipeline/sync/test_transparency',
+    'distributed/_pipeline/sync/test_worker',
+]
+_DEP_MODULES_CACHE: Dict[str, set] = {}
 
 DISTRIBUTED_TESTS_CONFIG = {}
 
 
 if dist.is_available():
-    if dist.is_mpi_available():
+    DISTRIBUTED_TESTS_CONFIG['test'] = {
+        'WORLD_SIZE': '1'
+    }
+    if not TEST_WITH_ROCM and dist.is_mpi_available():
         DISTRIBUTED_TESTS_CONFIG['mpi'] = {
-            'WORLD_SIZE': '3'
+            'WORLD_SIZE': '3',
+            'TEST_REPORT_SOURCE_OVERRIDE': 'dist-mpi'
         }
     if dist.is_nccl_available():
         DISTRIBUTED_TESTS_CONFIG['nccl'] = {
-            'WORLD_SIZE': '2' if torch.cuda.device_count() == 2 else '3'
+            'WORLD_SIZE': '2' if torch.cuda.device_count() == 2 else '3',
+            'TEST_REPORT_SOURCE_OVERRIDE': 'dist-nccl'
         }
-    if dist.is_gloo_available():
+    if not TEST_WITH_ROCM and dist.is_gloo_available():
         DISTRIBUTED_TESTS_CONFIG['gloo'] = {
-            'WORLD_SIZE': '2' if torch.cuda.device_count() == 2 else '3'
+            'WORLD_SIZE': '2' if torch.cuda.device_count() == 2 else '3',
+            'TEST_REPORT_SOURCE_OVERRIDE': 'dist-gloo'
         }
 
 # https://stackoverflow.com/questions/2549939/get-signal-names-from-numbers-in-python
@@ -117,50 +274,97 @@ SIGNALS_TO_NAMES_DICT = {getattr(signal, n): n for n in dir(signal)
                          if n.startswith('SIG') and '_' not in n}
 
 CPP_EXTENSIONS_ERROR = """
-Ninja (https://ninja-build.org) must be available to run C++ extensions tests,
-but it could not be found. Install ninja with `pip install ninja`
-or `conda install ninja`. Alternatively, disable C++ extensions test with
-`run_test.py --exclude cpp_extensions`.
+Ninja (https://ninja-build.org) is required for some of the C++ extensions
+tests, but it could not be found. Install ninja with `pip install ninja`
+or `conda install ninja`. Alternatively, disable said tests with
+`run_test.py --exclude test_cpp_extensions_aot_ninja test_cpp_extensions_jit`.
 """
 
+PYTORCH_COLLECT_COVERAGE = bool(os.environ.get("PYTORCH_COLLECT_COVERAGE"))
+
+JIT_EXECUTOR_TESTS = [
+    'test_jit_cuda_fuser',
+    'test_jit_profiling',
+    'test_jit_legacy',
+    'test_jit_fuser_legacy',
+]
 
 def print_to_stderr(message):
     print(message, file=sys.stderr)
 
 
-def run_test(executable, test_module, test_directory, options, *extra_unittest_args):
-    unittest_args = options.additional_unittest_args
+def get_executable_command(options, allow_pytest):
+    if options.coverage:
+        executable = ['coverage', 'run', '--parallel-mode', '--source=torch']
+    else:
+        executable = [sys.executable]
+    if options.pytest:
+        if allow_pytest:
+            executable += ['-m', 'pytest']
+        else:
+            print_to_stderr('Pytest cannot be used for this test. Falling back to unittest.')
+    return executable
+
+
+def run_test(test_module, test_directory, options, launcher_cmd=None, extra_unittest_args=None):
+    unittest_args = options.additional_unittest_args.copy()
     if options.verbose:
-        unittest_args.append('--verbose')
+        unittest_args.append(f'-{"v"*options.verbose}')  # in case of pytest
+    if test_module in RUN_PARALLEL_BLOCKLIST:
+        unittest_args = [arg for arg in unittest_args if not arg.startswith('--run-parallel')]
+    if extra_unittest_args:
+        assert isinstance(extra_unittest_args, list)
+        unittest_args.extend(extra_unittest_args)
+
+    # If using pytest, replace -f with equivalent -x
+    if options.pytest:
+        unittest_args = [arg if arg != '-f' else '-x' for arg in unittest_args]
+
     # Can't call `python -m unittest test_*` here because it doesn't run code
     # in `if __name__ == '__main__': `. So call `python test_*.py` instead.
-    argv = [test_module + '.py'] + unittest_args + list(extra_unittest_args)
+    argv = [test_module + '.py'] + unittest_args
 
-    command = executable + argv
+    # Extra arguments are not supported with pytest
+    executable = get_executable_command(options, allow_pytest=not extra_unittest_args)
+
+    command = (launcher_cmd or []) + executable + argv
+    print_to_stderr('Executing {} ... [{}]'.format(command, datetime.now()))
     return shell(command, test_directory)
 
 
-def test_cuda_primary_ctx(executable, test_module, test_directory, options):
-    return run_test(executable, test_module, test_directory, options, '--subprocess')
+def test_cuda_primary_ctx(test_module, test_directory, options):
+    return run_test(test_module, test_directory, options, extra_unittest_args=['--subprocess'])
 
 
-def test_cpp_extensions(executable, test_module, test_directory, options):
-    try:
-        cpp_extension.verify_ninja_availability()
-    except RuntimeError:
-        print(CPP_EXTENSIONS_ERROR)
-        return 1
+def _test_cpp_extensions_aot(test_module, test_directory, options, use_ninja):
+    if use_ninja:
+        try:
+            cpp_extension.verify_ninja_availability()
+        except RuntimeError:
+            print(CPP_EXTENSIONS_ERROR)
+            return 1
+
+    # Wipe the build folder, if it exists already
     cpp_extensions_test_dir = os.path.join(test_directory, 'cpp_extensions')
-    return_code = shell([sys.executable, 'setup.py', 'install', '--root', './install'],
-                        cwd=cpp_extensions_test_dir)
+    cpp_extensions_test_build_dir = os.path.join(cpp_extensions_test_dir, 'build')
+    if os.path.exists(cpp_extensions_test_build_dir):
+        shutil.rmtree(cpp_extensions_test_build_dir)
+
+    # Build the test cpp extensions modules
+    shell_env = os.environ.copy()
+    shell_env['USE_NINJA'] = str(1 if use_ninja else 0)
+    cmd = [sys.executable, 'setup.py', 'install', '--root', './install']
+    return_code = shell(cmd, cwd=cpp_extensions_test_dir, env=shell_env)
     if return_code != 0:
         return return_code
     if sys.platform != 'win32':
-        return_code = shell([sys.executable, 'setup.py', 'install', '--root', './install'],
-                            cwd=os.path.join(cpp_extensions_test_dir, 'no_python_abi_suffix_test'))
+        return_code = shell(cmd,
+                            cwd=os.path.join(cpp_extensions_test_dir, 'no_python_abi_suffix_test'),
+                            env=shell_env)
         if return_code != 0:
             return return_code
 
+    # "install" the test modules and run tests
     python_path = os.environ.get('PYTHONPATH', '')
     try:
         cpp_extensions = os.path.join(test_directory, 'cpp_extensions')
@@ -173,24 +377,39 @@ def test_cpp_extensions(executable, test_module, test_directory, options):
 
         assert install_directory, 'install_directory must not be empty'
         os.environ['PYTHONPATH'] = os.pathsep.join([install_directory, python_path])
-        return run_test(executable, test_module, test_directory, options)
+        return run_test(test_module, test_directory, options)
     finally:
         os.environ['PYTHONPATH'] = python_path
 
 
-def test_distributed(executable, test_module, test_directory, options):
+def test_cpp_extensions_aot_ninja(test_module, test_directory, options):
+    return _test_cpp_extensions_aot('test_cpp_extensions_aot', test_directory,
+                                    options, use_ninja=True)
+
+
+def test_cpp_extensions_aot_no_ninja(test_module, test_directory, options):
+    return _test_cpp_extensions_aot('test_cpp_extensions_aot',
+                                    test_directory, options, use_ninja=False)
+
+
+def test_distributed(test_module, test_directory, options):
     mpi_available = subprocess.call('command -v mpiexec', shell=True) == 0
     if options.verbose and not mpi_available:
         print_to_stderr(
             'MPI not available -- MPI backend tests will be skipped')
     config = DISTRIBUTED_TESTS_CONFIG
     for backend, env_vars in config.items():
+        if sys.platform == 'win32' and backend != 'gloo':
+            continue
         if backend == 'mpi' and not mpi_available:
             continue
         for with_init_file in {True, False}:
+            if sys.platform == 'win32' and not with_init_file:
+                continue
             tmp_dir = tempfile.mkdtemp()
             if options.verbose:
-                with_init = ' with file init_method' if with_init_file else ''
+                init_str = "with {} init_method"
+                with_init = init_str.format("file" if with_init_file else "env")
                 print_to_stderr(
                     'Running distributed tests for the {} backend{}'.format(
                         backend, with_init))
@@ -199,10 +418,10 @@ def test_distributed(executable, test_module, test_directory, options):
             os.environ['INIT_METHOD'] = 'env://'
             os.environ.update(env_vars)
             if with_init_file:
-                if test_module == "test_distributed":
-                    init_method = 'file://{}/'.format(tmp_dir)
+                if test_module in ["test_distributed_fork", "test_distributed_spawn"]:
+                    init_method = f'{FILE_SCHEMA}{tmp_dir}/'
                 else:
-                    init_method = 'file://{}/shared_init_file'.format(tmp_dir)
+                    init_method = f'{FILE_SCHEMA}{tmp_dir}/shared_init_file'
                 os.environ['INIT_METHOD'] = init_method
             try:
                 os.mkdir(os.path.join(tmp_dir, 'barrier'))
@@ -210,17 +429,19 @@ def test_distributed(executable, test_module, test_directory, options):
                 if backend == 'mpi':
                     # test mpiexec for --noprefix option
                     with open(os.devnull, 'w') as devnull:
+                        allowrunasroot_opt = '--allow-run-as-root' if subprocess.call(
+                            'mpiexec --allow-run-as-root -n 1 bash -c ""', shell=True,
+                            stdout=devnull, stderr=subprocess.STDOUT) == 0 else ''
                         noprefix_opt = '--noprefix' if subprocess.call(
-                            'mpiexec -n 1 --noprefix bash -c ""', shell=True,
+                            f'mpiexec {allowrunasroot_opt} -n 1 --noprefix bash -c ""', shell=True,
                             stdout=devnull, stderr=subprocess.STDOUT) == 0 else ''
 
-                    mpiexec = ['mpiexec', '-n', '3', noprefix_opt] + executable
+                    mpiexec = ['mpiexec', '-n', '3', noprefix_opt, allowrunasroot_opt]
 
-                    return_code = run_test(mpiexec, test_module,
-                                           test_directory, options)
+                    return_code = run_test(test_module, test_directory, options,
+                                           launcher_cmd=mpiexec)
                 else:
-                    return_code = run_test(executable, test_module, test_directory,
-                                           options)
+                    return_code = run_test(test_module, test_directory, options)
                 if return_code != 0:
                     return return_code
             finally:
@@ -229,9 +450,11 @@ def test_distributed(executable, test_module, test_directory, options):
 
 
 CUSTOM_HANDLERS = {
-    'cuda_primary_ctx': test_cuda_primary_ctx,
-    'cpp_extensions': test_cpp_extensions,
-    'distributed': test_distributed,
+    'test_cuda_primary_ctx': test_cuda_primary_ctx,
+    'test_cpp_extensions_aot_no_ninja': test_cpp_extensions_aot_no_ninja,
+    'test_cpp_extensions_aot_ninja': test_cpp_extensions_aot_ninja,
+    'distributed/test_distributed_fork': test_distributed,
+    'distributed/test_distributed_spawn': test_distributed,
 }
 
 
@@ -254,7 +477,8 @@ def parse_args():
     parser.add_argument(
         '-v',
         '--verbose',
-        action='store_true',
+        action='count',
+        default=0,
         help='print verbose information and test-by-test results')
     parser.add_argument(
         '--jit',
@@ -267,7 +491,8 @@ def parse_args():
              'TestTorch with pytest in verbose and coverage mode: '
              'python run_test.py -vci torch -pt')
     parser.add_argument(
-        '-c', '--coverage', action='store_true', help='enable coverage')
+        '-c', '--coverage', action='store_true', help='enable coverage',
+        default=PYTORCH_COLLECT_COVERAGE)
     parser.add_argument(
         '-i',
         '--include',
@@ -308,25 +533,35 @@ def parse_args():
              ' where you want to run all tests, but care more about some set, '
              'e.g. after making a change to a specific component')
     parser.add_argument(
-        '--ignore-win-blacklist',
+        '--ignore-win-blocklist',
         action='store_true',
-        help='always run blacklisted windows tests')
+        help='always run blocklisted windows tests')
+    parser.add_argument(
+        '--determine-from',
+        help='File of affected source filenames to determine which tests to run.')
+    parser.add_argument(
+        '--continue-through-error',
+        action='store_true',
+        help='Runs the full test suite despite one of the tests failing')
     parser.add_argument(
         'additional_unittest_args',
         nargs='*',
         help='additional arguments passed through to unittest, e.g., '
              'python run_test.py -i sparse -- TestSparse.test_factory_size_check')
+    parser.add_argument(
+        '--shard',
+        nargs=2,
+        type=int,
+        help='runs a shard of the tests (taking into account other selections), e.g., '
+        '--shard 2 3 will break up the selected tests into 3 shards and run the tests '
+        'in the 2nd shard (the first number should not exceed the second)',
+    )
+    parser.add_argument(
+        '--exclude-jit-executor',
+        action='store_true',
+        help='exclude tests that are run for a specific jit config'
+    )
     return parser.parse_args()
-
-
-def get_executable_command(options):
-    if options.coverage:
-        executable = ['coverage', 'run', '--parallel-mode', '--source torch']
-    else:
-        executable = [sys.executable]
-    if options.pytest:
-        executable += ['-m', 'pytest']
-    return executable
 
 
 def find_test_index(test, selected_tests, find_last_index=False):
@@ -353,7 +588,7 @@ def find_test_index(test, selected_tests, find_last_index=False):
             occurrence (first is default)
 
     Returns:
-        index of the first or last occurance of the given test
+        index of the first or last occurrence of the given test
     """
     idx = 0
     found_idx = -1
@@ -367,8 +602,8 @@ def find_test_index(test, selected_tests, find_last_index=False):
 
 
 def exclude_tests(exclude_list, selected_tests, exclude_message=None):
-    tests_copy = selected_tests[:]
     for exclude_test in exclude_list:
+        tests_copy = selected_tests[:]
         for test in tests_copy:
             if test.startswith(exclude_test):
                 if exclude_message is not None:
@@ -393,62 +628,246 @@ def get_selected_tests(options):
         last_index = find_test_index(options.last, selected_tests, find_last_index=True)
         selected_tests = selected_tests[:last_index + 1]
 
-    selected_tests = exclude_tests(options.exclude, selected_tests)
+    if options.shard:
+        assert len(options.shard) == 2, "Unexpected shard format"
+        assert min(options.shard) > 0, "Shards must be positive numbers"
+        which_shard, num_shards = options.shard
+        assert which_shard <= num_shards, "Selected shard must be less or equal that total number of shards"
+        assert num_shards <= len(selected_tests), f"Number of shards must be less than {len(selected_tests)}"
+        selected_tests = selected_tests[which_shard - 1 :: num_shards]
 
-    if sys.platform == 'win32' and not options.ignore_win_blacklist:
+    if options.exclude_jit_executor:
+        options.exclude.extend(JIT_EXECUTOR_TESTS)
+
+    selected_tests = exclude_tests(options.exclude, selected_tests)
+    # exclude PYTEST_TESTS if pytest not installed.
+    if importlib.util.find_spec('pytest') is None:
+        selected_tests = exclude_tests(PYTEST_TESTS, selected_tests, 'PyTest not found.')
+
+    if sys.platform == 'win32' and not options.ignore_win_blocklist:
         target_arch = os.environ.get('VSCMD_ARG_TGT_ARCH')
         if target_arch != 'x64':
-            WINDOWS_BLACKLIST.append('cpp_extensions')
-            WINDOWS_BLACKLIST.append('jit')
-            WINDOWS_BLACKLIST.append('jit_fuser')
+            WINDOWS_BLOCKLIST.append('cpp_extensions_aot_no_ninja')
+            WINDOWS_BLOCKLIST.append('cpp_extensions_aot_ninja')
+            WINDOWS_BLOCKLIST.append('cpp_extensions_jit')
+            WINDOWS_BLOCKLIST.append('jit')
+            WINDOWS_BLOCKLIST.append('jit_fuser')
 
-        selected_tests = exclude_tests(WINDOWS_BLACKLIST, selected_tests, 'on Windows')
+        selected_tests = exclude_tests(WINDOWS_BLOCKLIST, selected_tests, 'on Windows')
 
     elif TEST_WITH_ROCM:
-        selected_tests = exclude_tests(ROCM_BLACKLIST, selected_tests, 'on ROCm')
+        selected_tests = exclude_tests(ROCM_BLOCKLIST, selected_tests, 'on ROCm')
 
     return selected_tests
 
 
+def test_impact_of_file(filename):
+    """Determine what class of impact this file has on test runs.
+
+    Possible values:
+        TORCH - torch python code
+        CAFFE2 - caffe2 python code
+        TEST - torch test code
+        UNKNOWN - may affect all tests
+        NONE - known to have no effect on test outcome
+        CI - CI configuration files
+    """
+    parts = filename.split(os.sep)
+    if parts[0] in ['.jenkins', '.circleci']:
+        return 'CI'
+    if parts[0] in ['docs', 'scripts', 'CODEOWNERS', 'README.md']:
+        return 'NONE'
+    elif parts[0] == 'torch':
+        if parts[-1].endswith('.py') or parts[-1].endswith('.pyi'):
+            return 'TORCH'
+    elif parts[0] == 'caffe2':
+        if parts[-1].endswith('.py') or parts[-1].endswith('.pyi'):
+            return 'CAFFE2'
+    elif parts[0] == 'test':
+        if parts[-1].endswith('.py') or parts[-1].endswith('.pyi'):
+            return 'TEST'
+
+    return 'UNKNOWN'
+
+
+def log_test_reason(file_type, filename, test, options):
+    if options.verbose:
+        print_to_stderr(
+            'Determination found {} file {} -- running {}'.format(
+                file_type,
+                filename,
+                test,
+            )
+        )
+
+
+def get_dep_modules(test):
+    # Cache results in case of repetition
+    if test in _DEP_MODULES_CACHE:
+        return _DEP_MODULES_CACHE[test]
+
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    test_location = os.path.join(repo_root, 'test', test + '.py')
+    finder = modulefinder.ModuleFinder(
+        # Ideally exclude all third party modules, to speed up calculation.
+        excludes=[
+            'scipy',
+            'numpy',
+            'numba',
+            'multiprocessing',
+            'sklearn',
+            'setuptools',
+            'hypothesis',
+            'llvmlite',
+            'joblib',
+            'email',
+            'importlib',
+            'unittest',
+            'urllib',
+            'json',
+            'collections',
+            # Modules below are excluded because they are hitting https://bugs.python.org/issue40350
+            # Trigger AttributeError: 'NoneType' object has no attribute 'is_package'
+            'mpl_toolkits',
+            'google',
+            'onnx',
+            # Triggers RecursionError
+            'mypy'
+        ],
+    )
+    # HACK: some platforms default to ascii, so we can't just run_script :(
+    with open(test_location, 'r', encoding='utf-8') as fp:
+        finder.load_module('__main__', fp, test_location, ('', 'r', 1))
+
+    dep_modules = set(finder.modules.keys())
+    _DEP_MODULES_CACHE[test] = dep_modules
+    return dep_modules
+
+
+def determine_target(test, touched_files, options):
+    test = parse_test_module(test)
+    # Some tests are faster to execute than to determine.
+    if test not in SLOW_TESTS:
+        if options.verbose:
+            print_to_stderr(f'Running {test} without determination')
+        return True
+    # HACK: "no_ninja" is not a real module
+    if test.endswith('_no_ninja'):
+        test = test[:(-1 * len('_no_ninja'))]
+    if test.endswith('_ninja'):
+        test = test[:(-1 * len('_ninja'))]
+
+    dep_modules = get_dep_modules(test)
+
+    for touched_file in touched_files:
+        file_type = test_impact_of_file(touched_file)
+        if file_type == 'NONE':
+            continue
+        elif file_type == 'CI':
+            # Force all tests to run if any change is made to the CI
+            # configurations.
+            log_test_reason(file_type, touched_file, test, options)
+            return True
+        elif file_type == 'UNKNOWN':
+            # Assume uncategorized source files can affect every test.
+            log_test_reason(file_type, touched_file, test, options)
+            return True
+        elif file_type in ['TORCH', 'CAFFE2', 'TEST']:
+            parts = os.path.splitext(touched_file)[0].split(os.sep)
+            touched_module = ".".join(parts)
+            # test/ path does not have a "test." namespace
+            if touched_module.startswith('test.'):
+                touched_module = touched_module.split('test.')[1]
+            if (
+                touched_module in dep_modules
+                or touched_module == test.replace('/', '.')
+            ):
+                log_test_reason(file_type, touched_file, test, options)
+                return True
+
+    # If nothing has determined the test has run, don't run the test.
+    if options.verbose:
+        print_to_stderr(f'Determination is skipping {test}')
+
+    return False
+
+
+def run_test_module(test: str, test_directory: str, options) -> Optional[str]:
+    test_module = parse_test_module(test)
+
+    # Printing the date here can help diagnose which tests are slow
+    print_to_stderr('Running {} ... [{}]'.format(test, datetime.now()))
+    handler = CUSTOM_HANDLERS.get(test, run_test)
+    return_code = handler(test_module, test_directory, options)
+    assert isinstance(return_code, int) and not isinstance(
+        return_code, bool), 'Return code should be an integer'
+    if return_code == 0:
+        return None
+
+    message = f'{test} failed!'
+    if return_code < 0:
+        # subprocess.Popen returns the child process' exit signal as
+        # return code -N, where N is the signal number.
+        signal_name = SIGNALS_TO_NAMES_DICT[-return_code]
+        message += f' Received signal: {signal_name}'
+    return message
+
 def main():
     options = parse_args()
-    executable = get_executable_command(options)  # this is a list
-    print_to_stderr('Test executor: {}'.format(executable))
     test_directory = os.path.dirname(os.path.abspath(__file__))
     selected_tests = get_selected_tests(options)
 
     if options.verbose:
         print_to_stderr('Selected tests: {}'.format(', '.join(selected_tests)))
 
-    if options.coverage:
+    if options.coverage and not PYTORCH_COLLECT_COVERAGE:
         shell(['coverage', 'erase'])
 
     if options.jit:
         selected_tests = filter(lambda test_name: "jit" in test_name, TESTS)
 
-    for test in selected_tests:
-        test_name = 'test_{}'.format(test)
-        test_module = parse_test_module(test)
+    if options.determine_from is not None and os.path.exists(options.determine_from):
+        with open(options.determine_from, 'r') as fh:
+            touched_files = [
+                os.path.normpath(name.strip()) for name in fh.read().split('\n')
+                if len(name.strip()) > 0
+            ]
+        # HACK: Ensure the 'test' paths can be traversed by Modulefinder
+        sys.path.append('test')
+        selected_tests = [
+            test for test in selected_tests
+            if determine_target(test, touched_files, options)
+        ]
+        sys.path.remove('test')
 
-        # Printing the date here can help diagnose which tests are slow
-        print_to_stderr('Running {} ... [{}]'.format(test_name, datetime.now()))
-        handler = CUSTOM_HANDLERS.get(test_module, run_test)
-        return_code = handler(executable, test_name, test_directory, options)
-        assert isinstance(return_code, int) and not isinstance(
-            return_code, bool), 'Return code should be an integer'
-        if return_code != 0:
-            message = '{} failed!'.format(test_name)
-            if return_code < 0:
-                # subprocess.Popen returns the child process' exit signal as
-                # return code -N, where N is the signal number.
-                signal_name = SIGNALS_TO_NAMES_DICT[-return_code]
-                message += ' Received signal: {}'.format(signal_name)
-            raise RuntimeError(message)
+    has_failed = False
+    failure_messages = []
+    try:
+        for test in selected_tests:
+            options_clone = copy.deepcopy(options)
+            if test in USE_PYTEST_LIST:
+                options_clone.pytest = True
+            err_message = run_test_module(test, test_directory, options_clone)
+            if err_message is None:
+                continue
+            has_failed = True
+            failure_messages.append(err_message)
+            if not options_clone.continue_through_error:
+                raise RuntimeError(err_message)
+            print_to_stderr(err_message)
+    finally:
+        if options.coverage:
+            test_dir = os.path.dirname(os.path.abspath(__file__))
+            if not PYTORCH_COLLECT_COVERAGE:
+                shell(['coverage', 'combine'], cwd=test_dir)
+                shell(['coverage', 'html'], cwd=test_dir)
+            else:
+                shell(['coverage', 'combine', '--append'], cwd=test_dir)
 
-    if options.coverage:
-        shell(['coverage', 'combine'])
-        shell(['coverage', 'html'])
-
+    if options.continue_through_error and has_failed:
+        for err in failure_messages:
+            print_to_stderr(err)
+        sys.exit(1)
 
 if __name__ == '__main__':
     main()
